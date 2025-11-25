@@ -1,0 +1,67 @@
+# =============================================================================
+# Production Configuration
+# =============================================================================
+
+environment: production
+debug: false
+
+# Data paths (typically S3 in production)
+data:
+  raw_path: s3://retail-forecasting/data/raw
+  processed_path: s3://retail-forecasting/data/processed
+  features_path: s3://retail-forecasting/data/features
+  s3_bucket: retail-forecasting
+  s3_prefix: data/
+
+# Feature engineering
+features:
+  lag_days: [7, 14, 28, 365]
+  rolling_windows: [7, 14, 28, 56]
+  rolling_aggregations: ["mean", "std", "min", "max"]
+  include_holidays: true
+  include_events: true
+  feature_store_enabled: true
+  feature_store_path: s3://retail-forecasting/features
+
+# Model configuration
+model:
+  name: lightgbm_forecaster
+  version: "2.0.0"
+  n_estimators: 2000
+  learning_rate: 0.05
+  max_depth: 8
+  num_leaves: 63
+  min_child_samples: 50
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_alpha: 0.1
+  reg_lambda: 0.1
+  early_stopping_rounds: 100
+  objective: tweedie
+  tweedie_variance_power: 1.1
+  save_path: s3://retail-forecasting/models
+
+# Training configuration
+training:
+  n_folds: 5
+  cv_gap_days: 28
+  mlflow_tracking_uri: https://mlflow.example.com
+  mlflow_experiment_name: retail_forecasting_production
+  random_seed: 42
+
+# Serving configuration
+serving:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  model_path: /app/models/production/model.pkl
+  batch_size: 1000
+  timeout_seconds: 30
+  feature_store_enabled: true
+  cache_ttl_seconds: 3600
+
+# Logging configuration
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  json_format: true

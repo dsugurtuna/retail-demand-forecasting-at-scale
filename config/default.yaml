@@ -1,0 +1,104 @@
+# =============================================================================
+# Default Configuration
+# =============================================================================
+# Base configuration for all environments
+# Override in environment-specific files or via environment variables
+# =============================================================================
+
+environment: development
+debug: true
+
+# Data configuration
+data:
+  raw_path: data/raw
+  processed_path: data/processed
+  features_path: data/features
+  sales_file: sales_train_evaluation.csv
+  calendar_file: calendar.csv
+  prices_file: sell_prices.csv
+  s3_bucket: null
+  s3_prefix: data/
+
+# Feature engineering configuration
+features:
+  # Lag features
+  lag_days: [7, 14, 28, 365]
+  
+  # Rolling window features
+  rolling_windows: [7, 14, 28, 56]
+  rolling_aggregations: ["mean", "std", "min", "max"]
+  
+  # Price features
+  price_lags: [1, 7, 28]
+  
+  # Calendar features
+  include_holidays: true
+  include_events: true
+  
+  # Feature store
+  feature_store_enabled: false
+  feature_store_path: data/feature_store
+
+# Model configuration
+model:
+  name: lightgbm_forecaster
+  version: "1.0.0"
+  
+  # Hyperparameters
+  n_estimators: 2000
+  learning_rate: 0.05
+  max_depth: 8
+  num_leaves: 63
+  min_child_samples: 50
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_alpha: 0.1
+  reg_lambda: 0.1
+  
+  # Training settings
+  early_stopping_rounds: 100
+  verbose: 100
+  
+  # Objective
+  objective: tweedie
+  tweedie_variance_power: 1.1
+  
+  # Model persistence
+  save_path: models
+
+# Training configuration
+training:
+  # Data splits
+  train_start: "2011-01-29"
+  train_end: "2016-04-24"
+  valid_start: "2016-04-25"
+  valid_end: "2016-05-22"
+  
+  # Cross-validation
+  n_folds: 5
+  cv_gap_days: 28
+  
+  # MLflow
+  mlflow_tracking_uri: mlruns
+  mlflow_experiment_name: retail_forecasting
+  
+  # Reproducibility
+  random_seed: 42
+
+# Serving configuration
+serving:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  model_path: models/model.pkl
+  batch_size: 1000
+  timeout_seconds: 30
+  feature_store_enabled: false
+  cache_ttl_seconds: 3600
+
+# Logging configuration
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: null
+  json_format: false

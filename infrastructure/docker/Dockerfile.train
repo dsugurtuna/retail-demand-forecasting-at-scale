@@ -1,0 +1,81 @@
+# =============================================================================
+# Training Image
+# =============================================================================
+# Multi-stage build for optimized production image
+# Supports GPU training with CUDA support
+# =============================================================================
+
+# Build stage
+FROM python:3.11-slim as builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir build && \
+    pip wheel --no-cache-dir --wheel-dir /wheels -e .
+
+# =============================================================================
+# Production stage
+# =============================================================================
+FROM python:3.11-slim as production
+
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd -r forecasting && useradd -r -g forecasting forecasting
+
+# Copy wheels and install
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
+
+# Copy application code
+COPY src/ ./src/
+COPY config/ ./config/
+
+# Set ownership
+RUN chown -R forecasting:forecasting /app
+
+USER forecasting
+
+# Environment variables
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV FORECAST_ENVIRONMENT=production
+
+# Default command
+CMD ["python", "-m", "src.train"]
+
+# =============================================================================
+# Development stage
+# =============================================================================
+FROM production as development
+
+USER root
+
+# Install dev dependencies
+RUN pip install --no-cache-dir \
+    pytest \
+    pytest-cov \
+    pytest-mock \
+    black \
+    ruff \
+    mypy \
+    ipython \
+    jupyter
+
+USER forecasting
+
+CMD ["bash"]
