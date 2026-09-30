@@ -1,5 +1,9 @@
 # =============================================================================
-# Production Configuration
+# Example environment overrides (illustrative placeholders)
+# =============================================================================
+# load_config(environment="production") merges this file over the defaults.
+# The training CLI does not read these files yet, nothing here is deployed,
+# and the S3 and MLflow values are placeholders, not real endpoints.
 # =============================================================================
 
 environment: production

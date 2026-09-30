@@ -1,8 +1,9 @@
 # =============================================================================
-# Default Configuration
+# Default settings for src.utils.config.load_config
 # =============================================================================
-# Base configuration for all environments
-# Override in environment-specific files or via environment variables
+# Validated by the pydantic models in src/utils/config.py. The training CLI
+# (python -m src.train) takes its settings from command-line flags and does
+# not read this file yet.
 # =============================================================================
 
 environment: development
