@@ -1,8 +1,9 @@
 """
 Ensemble forecaster combining multiple models.
 
-Implements sophisticated model combination strategies for
-improved accuracy and robustness.
+Combines fitted forecasters by weighted average (weights can be fitted on
+validation data with SLSQP) or by median. Only LightGBM members exist in this
+repository; there are no deep-learning members.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ class EnsembleConfig(BaseModel):
 
     method: str = Field(
         default="weighted_average",
-        description="Ensemble method: 'weighted_average', 'stacking', 'voting'",
+        description="'weighted_average' or 'median'; anything else falls back to weighted_average",
     )
 
     weights: dict[str, float] | None = Field(
@@ -46,18 +47,17 @@ class EnsembleForecaster(BaseForecaster):
     """
     Ensemble forecaster combining multiple base models.
 
-    Supports multiple ensemble strategies:
-    - Weighted averaging (simple or optimized)
-    - Stacking with meta-learner
-    - Voting (for classification-like tasks)
+    Strategies:
+    - Weighted average, with fixed weights or weights fitted on validation data
+    - Median of member forecasts
 
     Example:
         >>> lgb_model = LightGBMForecaster()
         >>> lgb_model.fit(X_train, y_train)
         >>>
         >>> ensemble = EnsembleForecaster()
-        >>> ensemble.add_model("lightgbm", lgb_model, weight=0.5)
-        >>> ensemble.add_model("xgboost", xgb_model, weight=0.5)
+        >>> ensemble.add_model("lgb_a", lgb_model, weight=0.5)
+        >>> ensemble.add_model("lgb_b", other_lgb_model, weight=0.5)
         >>>
         >>> predictions = ensemble.predict(X_test)
     """

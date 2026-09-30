@@ -1,379 +1,71 @@
-# =============================================================================
-# Retail Demand Forecasting - Architecture Documentation
-# =============================================================================
+# Architecture
 
-## System Overview
+What each part of the code does, how data flows through it and where the leakage controls sit. For the reasons behind the choices, see [WHY.md](WHY.md).
 
-This document provides comprehensive technical documentation for the Retail
-Demand Forecasting at Scale system. It covers architecture decisions, component
-interactions, and deployment patterns.
+## Data flow
 
-## Architecture Diagram
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                           RETAIL DEMAND FORECASTING                          │
-│                              SYSTEM ARCHITECTURE                             │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   Data      │    │   Feature   │    │   Model     │    │   Serving   │
-│   Sources   │───▶│   Pipeline  │───▶│   Training  │───▶│   Layer     │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-       │                  │                  │                  │
-       │                  │                  │                  │
-       ▼                  ▼                  ▼                  ▼
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│  S3/Local   │    │   Feature   │    │   MLflow    │    │   FastAPI   │
-│   Storage   │    │    Store    │    │   Registry  │    │   Endpoint  │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+```mermaid
+flowchart TD
+    A["Synthetic generator<br/>src/data/synthetic.py"] --> C
+    B["M5 CSV/Parquet files<br/>src/data/loader.py"] --> C
+    C["merge_m5_frames<br/>one row per series per day"] --> D["DataValidator<br/>Pandera schemas + rules"]
+    D --> E["Hide target after origin"]
+    E --> F["FeatureEngineer<br/>temporal, price, hierarchical"]
+    F --> G["LightGBMForecaster<br/>early stopping on last 28 days"]
+    G --> H["Forecast next 28 days"]
+    H --> I["Score: WRMSSE, RMSE, MAE<br/>vs two naive baselines"]
+    F --> J["BacktestEngine<br/>rolling origins"]
+    G --> K["artefacts/: model, metrics.json,<br/>predictions.csv"]
+    K --> L["FastAPI skeleton<br/>src/serving"]
 ```
 
-## Component Architecture
-
-### 1. Data Layer (`src/data/`)
-
-The data layer handles all data ingestion, validation, and preprocessing.
-
-```python
-# Component: DataLoader
-# Purpose: Unified data loading from multiple sources
-
-DataLoader
-├── load_sales()        # Load sales data with lazy evaluation
-├── load_calendar()     # Load calendar/holiday data
-├── load_prices()       # Load price data
-└── load_from_s3()      # S3 integration for cloud deployment
-```
-
-**Key Design Decisions:**
-- **Polars over Pandas**: 2-5x faster for large datasets, better memory efficiency
-- **Lazy evaluation**: Deferred execution for query optimization
-- **Schema validation**: Pandera schemas ensure data quality at ingestion
-
-### 2. Feature Engineering (`src/features/`)
-
-Modular feature generation with temporal awareness.
-
-```python
-# Feature Generation Pipeline
-
-FeatureEngineer
-├── TemporalFeatureGenerator
-│   ├── Lag features (7, 14, 28, 365 days)
-│   ├── Rolling statistics (mean, std, min, max)
-│   ├── Calendar features (DOW, month, holidays)
-│   └── Cyclical encoding (sin/cos transformations)
-│
-├── PriceFeatureGenerator
-│   ├── Price momentum
-│   ├── Promotion detection
-│   └── Price elasticity proxies
-│
-├── HierarchicalFeatureGenerator
-│   ├── Cross-level aggregations
-│   └── Hierarchical encodings
-│
-└── FeatureStore
-    ├── Point-in-time retrieval
-    ├── Feature versioning
-    └── Online/offline serving
-```
-
-**Key Design Decisions:**
-- **Temporal leak prevention**: All features use point-in-time calculations
-- **Hierarchical aggregations**: Capture item→store→region patterns
-- **Feature store**: Enable feature reuse and online serving
-
-### 3. Model Layer (`src/models/`)
-
-Production-grade model implementations with MLOps integration.
-
-```python
-# Model Hierarchy
-
-BaseForecaster (Abstract)
-├── LightGBMForecaster
-│   ├── Custom WRMSSE objective
-│   ├── Confidence interval estimation
-│   └── Feature importance analysis
-│
-└── EnsembleForecaster
-    ├── Model combination strategies
-    ├── Weight optimization
-    └── Calibration layer
-```
-
-**Hyperparameter Defaults (Optimized for M5):**
-```yaml
-n_estimators: 2000
-learning_rate: 0.05
-max_depth: 8
-num_leaves: 63
-min_child_samples: 50
-subsample: 0.8
-colsample_bytree: 0.8
-objective: tweedie
-tweedie_variance_power: 1.1
-```
-
-### 4. Evaluation Framework (`src/evaluation/`)
-
-Comprehensive evaluation with backtesting.
-
-```python
-# Evaluation Components
-
-Metrics
-├── RMSE, MAE, MAPE, sMAPE
-├── MASE (scaled error)
-├── WRMSSE (M5 competition metric)
-└── Coverage metrics
-
-BacktestEngine
-├── Rolling origin CV
-├── Gap period handling
-├── Expanding/sliding windows
-└── Metrics aggregation
-```
-
-### 5. Serving Layer (`src/serving/`)
-
-Production API with health monitoring.
-
-```python
-# API Endpoints
-
-FastAPI Application
-├── GET  /health        # Kubernetes health probe
-├── GET  /ready         # Readiness probe
-├── GET  /live          # Liveness probe
-├── POST /predict       # Single prediction
-├── POST /predict/batch # Batch predictions
-├── POST /predict/horizon # Multi-day forecast
-├── GET  /metrics       # Prometheus metrics
-└── GET  /model/info    # Model metadata
-```
-
-## Data Flow
-
-### Training Pipeline
-
-```
-┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
-│  Raw     │───▶│  Validate│───▶│  Feature │───▶│  Train   │
-│  Data    │    │  & Clean │    │  Engineer│    │  Model   │
-└──────────┘    └──────────┘    └──────────┘    └──────────┘
-                                      │                │
-                                      ▼                ▼
-                              ┌──────────┐    ┌──────────┐
-                              │  Feature │    │  MLflow  │
-                              │  Store   │    │  Registry│
-                              └──────────┘    └──────────┘
-```
-
-### Inference Pipeline
-
-```
-┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
-│  API     │───▶│  Feature │───▶│  Model   │───▶│  Post-   │
-│  Request │    │  Lookup  │    │  Predict │    │  Process │
-└──────────┘    └──────────┘    └──────────┘    └──────────┘
-                     │                │
-                     ▼                ▼
-              ┌──────────┐    ┌──────────┐
-              │  Redis   │    │  Metrics │
-              │  Cache   │    │  Export  │
-              └──────────┘    └──────────┘
-```
-
-## Deployment Architecture
-
-### Kubernetes Deployment
-
-```yaml
-# Simplified deployment structure
-
-Namespace: forecasting
-├── Deployment: api (replicas: 3)
-│   └── Container: forecasting-api
-│       ├── Resources: 2Gi memory, 1 CPU
-│       └── Probes: /health, /ready, /live
-│
-├── Deployment: training (replicas: 1)
-│   └── Container: forecasting-train
-│       └── Resources: 8Gi memory, 4 CPU
-│
-├── Service: api-service (LoadBalancer)
-│   └── Port: 8000
-│
-├── ConfigMap: forecasting-config
-│   └── config.yaml
-│
-├── Secret: forecasting-secrets
-│   └── MLflow credentials, S3 keys
-│
-└── HPA: api-hpa
-    └── Scale: 3-10 pods, 70% CPU target
-```
-
-### Infrastructure Components
-
-| Component | Purpose | Technology |
-|-----------|---------|------------|
-| Container Registry | Image storage | GitHub Container Registry |
-| Artifact Storage | Model & data storage | AWS S3 / MinIO |
-| Experiment Tracking | Model versioning | MLflow |
-| Secrets Management | Credential storage | Kubernetes Secrets |
-| Monitoring | Metrics & alerting | Prometheus + Grafana |
-| Log Aggregation | Centralized logging | ELK Stack / Loki |
-
-## Configuration Management
-
-### Environment Hierarchy
-
-```
-config/
-├── default.yaml      # Base configuration
-├── development.yaml  # Local development
-├── staging.yaml      # Staging environment
-└── production.yaml   # Production settings
-```
-
-### Configuration Loading
-
-```python
-# Priority (highest to lowest):
-# 1. Environment variables (FORECAST_*)
-# 2. Environment-specific config file
-# 3. Default config file
-# 4. Pydantic defaults
-
-config = load_config(
-    config_path="config/default.yaml",
-    environment="production"
-)
-```
-
-## Security Considerations
-
-### API Security
-- Rate limiting per client
-- Request validation with Pydantic
-- Input sanitization
-
-### Data Security
-- Encryption at rest (S3 SSE)
-- Encryption in transit (TLS 1.3)
-- Audit logging for data access
-
-### Secrets Management
-- No hardcoded credentials
-- Kubernetes Secrets for sensitive data
-- Regular credential rotation
-
-## Performance Optimization
-
-### Model Serving
-- Model preloading at startup
-- Prediction batching
-- Redis caching for features
-- Async request handling
-
-### Training
-- Polars for data processing (2-5x faster than Pandas)
-- LightGBM histogram-based learning
-- Early stopping to prevent overfitting
-- Parallel feature computation
-
-### Benchmarks
-
-| Operation | Latency (p50) | Latency (p99) | Throughput |
-|-----------|---------------|---------------|------------|
-| Single prediction | 15ms | 50ms | 200 req/s |
-| Batch (100 items) | 100ms | 300ms | 50 req/s |
-| Model training | 30min | 45min | N/A |
-
-## Monitoring & Alerting
-
-### Key Metrics
-
-```prometheus
-# Prometheus metrics exported
-
-forecasting_predictions_total{status}     # Total predictions
-forecasting_inference_latency_seconds     # Inference latency histogram
-forecasting_model_version{version}        # Current model version
-forecasting_errors_total{type}            # Error counts by type
-forecasting_feature_cache_hits_total      # Cache hit rate
-```
-
-### Alerting Rules
-
-| Alert | Condition | Severity |
-|-------|-----------|----------|
-| High Latency | p99 > 500ms for 5min | Warning |
-| Error Rate | >1% errors for 5min | Critical |
-| Model Staleness | Model age > 7 days | Warning |
-| Service Down | Health check failing | Critical |
-
-## Development Workflow
-
-### Local Development
-
-```bash
-# Start local environment
-docker-compose up -d
-
-# Run tests
-pytest tests/ -v
-
-# Lint and format
-ruff check src tests
-black src tests
-
-# Type check
-mypy src
-```
-
-### CI/CD Pipeline
-
-```
-┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
-│  Lint   │───▶│  Test   │───▶│  Build  │───▶│ Deploy  │
-│  Format │    │  Unit   │    │  Docker │    │ Staging │
-└─────────┘    └─────────┘    └─────────┘    └─────────┘
-                    │              │               │
-                    ▼              ▼               ▼
-              ┌─────────┐    ┌─────────┐    ┌─────────┐
-              │  Test   │    │  Push   │    │ Deploy  │
-              │  Integ  │    │  GHCR   │    │  Prod   │
-              └─────────┘    └─────────┘    └─────────┘
-```
-
-## Future Roadmap
-
-### Phase 1: Foundation (Current)
-- [x] Core forecasting models
-- [x] API serving layer
-- [x] Docker containerization
-- [x] CI/CD pipeline
-
-### Phase 2: Enhancement
-- [ ] Deep learning models (TFT, N-BEATS)
-- [ ] Real-time feature streaming
-- [ ] A/B testing framework
-- [ ] Automated retraining
-
-### Phase 3: Scale
-- [ ] Multi-region deployment
-- [ ] GraphQL API
-- [ ] Feature platform integration
-- [ ] AutoML pipeline
-
-## References
-
-- [M5 Competition](https://www.kaggle.com/c/m5-forecasting-accuracy)
-- [LightGBM Documentation](https://lightgbm.readthedocs.io/)
-- [MLflow Model Registry](https://mlflow.org/docs/latest/model-registry.html)
-- [FastAPI Best Practices](https://fastapi.tiangolo.com/deployment/)
+## Modules
+
+| Module | What it does |
+|---|---|
+| `src/data/synthetic.py` | Generates M5-shaped sales, calendar and prices. Demand responds to weekday, season, trend, events, SNAP days and price (promotions lift sales). Poisson counts, so slow movers have zero days. Can write M5-format CSVs. |
+| `src/data/loader.py` | Reads the three M5 files (CSV or Parquet) from a local directory, optionally for some stores, melts sales to long format and joins everything. Raises if a file is missing. |
+| `src/data/validators.py` | Pandera schemas for sales, calendar and prices, plus rules for duplicates, negative sales and history length. |
+| `src/data/preprocessor.py` | Optional outlier capping and dtype shrinking. Not used by the training run. |
+| `src/features/temporal.py` | Lags (only those >= `min_lag`), rolling mean/std/min/max/CV on the target shifted by `min_lag`, expanding mean, calendar and cyclical encodings, UK and US holiday flags and distances. `add_calendar_features` is shared with serving. |
+| `src/features/price.py` | Price change, momentum, volatility, promotion flags, price relative to category and store. Prices are treated as known for the horizon, as in M5. |
+| `src/features/hierarchical.py` | For item, department, category, store and state: rolling statistics of the level's daily total shifted by `min_lag`, and each series' lagged share of that total. |
+| `src/features/engineer.py` | Runs the generators, pushes one `min_lag` into all of them, turns inf/NaN into missing, drops constant columns, stores features as float32 and decides which columns are model inputs. |
+| `src/features/store.py` | Local cache of feature sets: versioned Parquet plus JSON metadata. Not an online feature store. |
+| `src/models/lightgbm_model.py` | LightGBM wrapper: Tweedie by default, optional weighted squared-error objective (a WRMSSE surrogate), early stopping, save/load, deterministic training. |
+| `src/models/ensemble.py` | Weighted average of fitted models, with weights optimised on validation data. Only LightGBM members exist today. |
+| `src/evaluation/metrics.py` | RMSE, MAE, MAPE, sMAPE, MASE, and WRMSSE: per-series, the M5 scale, 12-level hierarchical, and row weights for the surrogate objective. |
+| `src/evaluation/backtesting.py` | Rolling-origin backtests with per-fold feature building and a fresh model per fold. |
+| `src/train.py` | The command-line pipeline and the smoke checks. |
+| `src/serving/` | FastAPI app and prediction service. See the limitation in [API_REFERENCE.md](API_REFERENCE.md). |
+| `src/utils/` | Typed settings (`config.py`) and logging setup. The training CLI takes flags and does not read the YAML files yet. |
+
+## Leakage controls
+
+A forecast made at origin *T* for day *T + h* may only use target values from day *T* or earlier. The code enforces this in four places:
+
+1. **Feature construction.** Every target-based feature is shifted by `min_lag` days before any rolling or cumulative operation. With `min_lag` equal to the horizon (28), a feature for day *T + 28* uses nothing after day *T*.
+2. **Masking.** Before features are built for a forecast or a backtest fold, target values after the origin are replaced with nulls. Even a misconfigured feature cannot read them.
+3. **Validation.** Early stopping uses the last 28 days before the origin, chosen by date.
+4. **Tests.** `tests/unit/test_features.py::TestNoLeakage` scrambles target values after a cut-off and checks that no feature up to *cut-off + min_lag* changes. The smoke run repeats the same check on its own data every time it runs.
+
+Prices, calendar, events and SNAP flags are treated as known in advance, as in the M5 data.
+
+## Outputs of a training run
+
+`python -m src.train ... --output-dir DIR` writes:
+
+| File | Contents |
+|---|---|
+| `DIR/model/` | `model.txt` (LightGBM), `metadata.json`, `config.json`, `categorical_features.json` |
+| `DIR/metrics.json` | Data summary, feature counts, holdout scores for the model and baselines, WRMSSE by level, backtest folds, smoke checks, versions |
+| `DIR/predictions.csv` | Actuals, model forecasts and both baselines for the holdout window |
+| `DIR/feature_importance.csv` | LightGBM gain importance |
+| `DIR/run_config.json` | Every setting used |
+
+## CI
+
+- `.github/workflows/ci.yml`: ruff, ruff format, mypy, and pytest on Python 3.11 and 3.12. The test suite includes the smoke training run.
+- `.github/workflows/train.yml`: the smoke run weekly; larger synthetic or M5 runs on manual dispatch (inputs are documented in the file).
+
+Docker files exist but are not built in CI.

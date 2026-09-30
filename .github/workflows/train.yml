@@ -5,18 +5,21 @@
 # check fails (see `python -m src.train --help`). It takes about a minute and
 # catches breakage from new releases of LightGBM, Polars, pandas or Pandera.
 #
-# Why not full training on a schedule? The old job tried to "download
-# training data" (the step only echoed text), installed PyTorch and a dozen
-# unused libraries until pip gave up resolving them, then called a module
-# that did not exist. It failed every week without testing anything. The M5
-# data needs a Kaggle account and more memory than a hosted runner has for
-# all 30,490 series, so full training is an explicit, manual choice.
+# Why not full training on a schedule? The old job "downloaded training
+# data" with a step that only echoed text, ran for up to 80 minutes, tried to
+# install PyTorch and a dozen libraries the code never imports, and pointed at
+# a training module that did not exist. It failed every week without testing
+# anything. The M5 data needs a Kaggle account, and all 30,490 series need
+# more memory than a hosted runner has, so full training is an explicit,
+# manual choice.
 #
 # Manual runs (Actions > Model Training > Run workflow) take these inputs:
 #   mode            smoke | synthetic | m5
 #   n_items         synthetic mode: number of items (default 210)
 #   n_stores        synthetic mode: stores, 1-10 (default 10)
-#   n_days          synthetic mode: days of history (default 1941, as M5)
+#   n_days          synthetic mode: days of history (default 1941, as M5).
+#                   The defaults (2,100 series) peaked at 10.2 GB of RAM in a
+#                   local run with one backtest fold.
 #   m5_stores       m5 mode: comma-separated store IDs (default CA_1);
 #                   empty means all ten stores, which will not fit in a
 #                   standard runner's memory

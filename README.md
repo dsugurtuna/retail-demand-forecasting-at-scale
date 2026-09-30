@@ -1,649 +1,147 @@
-# 🛒 Retail Demand Forecasting at Scale
+# Retail demand forecasting
 
-<div align="center">
+[![CI](https://github.com/dsugurtuna/retail-demand-forecasting-at-scale/actions/workflows/ci.yml/badge.svg)](https://github.com/dsugurtuna/retail-demand-forecasting-at-scale/actions/workflows/ci.yml)
+[![Model Training](https://github.com/dsugurtuna/retail-demand-forecasting-at-scale/actions/workflows/train.yml/badge.svg)](https://github.com/dsugurtuna/retail-demand-forecasting-at-scale/actions/workflows/train.yml)
 
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![LightGBM](https://img.shields.io/badge/Model-LightGBM-green?logo=lightgbm)](https://lightgbm.readthedocs.io/)
-[![PyTorch](https://img.shields.io/badge/Deep%20Learning-PyTorch-EE4C2C?logo=pytorch)](https://pytorch.org/)
-[![MLflow](https://img.shields.io/badge/MLOps-MLflow-0194E2?logo=mlflow)](https://mlflow.org/)
-[![Apache Airflow](https://img.shields.io/badge/Orchestration-Airflow-017CEE?logo=apacheairflow)](https://airflow.apache.org/)
-[![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi)](https://fastapi.tiangolo.com/)
-[![Docker](https://img.shields.io/badge/Container-Docker-2496ED?logo=docker)](https://www.docker.com/)
-[![Tests](https://img.shields.io/badge/Tests-pytest-0A9EDC?logo=pytest)](https://pytest.org/)
-[![Code style: black](https://img.shields.io/badge/Code%20Style-Black-000000?logo=python)](https://github.com/psf/black)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+A LightGBM pipeline that forecasts daily unit sales 28 days ahead for M5-style retail data, with leakage-safe features, rolling-origin backtests and the M5 competition's WRMSSE metric, checked against naive baselines on every run.
 
-**Enterprise-grade ML pipeline for demand forecasting at 600K+ SKU scale**
+## The problem
 
-[Features](#-key-features) • [Architecture](#-system-architecture) • [Quick Start](#-quick-start) • [API](#-api-reference) • [Benchmarks](#-performance-benchmarks)
+Stores need a daily forecast for every item, weeks ahead, to decide what to stock. Most item-store series are short, noisy and full of zero days, so the hard parts are not the model: they are building features that do not quietly use the future, scoring forecasts in a way that reflects money and stock decisions, and showing the result beats what a planner could do with a spreadsheet.
 
-</div>
+## What this does
 
----
+- **Loads** the [M5 competition](https://www.kaggle.com/c/m5-forecasting-accuracy) files (sales, calendar, prices), or generates synthetic data in the same format, and **validates** them with Pandera before anything else runs.
+- **Builds features** (115 model inputs in the smoke run; the exact count for each run is in its `metrics.json`): lags and rolling statistics of sales, calendar and UK/US holiday signals, price changes and promotion flags, and lagged totals and shares for item, department, category, store and state. Every sales-based feature is at least 28 days old.
+- **Trains** one LightGBM model across all series (Tweedie objective by default; an optional weighted squared-error objective acts as a WRMSSE surrogate), with early stopping on the last 28 days before the forecast origin.
+- **Scores** the next 28 days with WRMSSE at the 12 M5 aggregation levels, plus RMSE and MAE, against two baselines: "repeat last week" and "last 28-day average".
+- **Backtests** over several forecast origins, rebuilding features and retraining in each fold.
+- **Writes** the model, metrics, forecasts and settings to disk, and includes a FastAPI skeleton that can load the model (see Limitations).
 
-## 📋 Executive Summary
+## Quickstart
 
-This repository implements a **production-ready demand forecasting system** designed for enterprise retail operations. The solution combines gradient boosting methods with state-of-the-art temporal deep learning to generate accurate, explainable forecasts at massive scale.
-
-### Business Impact
-
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
-| Mean Absolute Percentage Error (MAPE) | 18.2% | 8.7% | **52% reduction** |
-| Stockout Rate | 12.4% | 6.1% | **51% reduction** |
-| Excess Inventory Costs | £2.4M | £1.7M | **£700K annual savings** |
-| Forecast Generation Time | 4 hours | 23 mins | **10x faster** |
-| Analyst Ad-hoc Requests | 120/month | 45/month | **63% reduction** |
-
-### Key Achievements
-- 🏆 **Top 2% solution** methodology adapted from M5 Forecasting Competition
-- 📊 Handles **600,000+ product-store combinations** with 28-day rolling forecasts
-- ⚡ Sub-second inference latency via optimized model serving
-- 🔍 Full model explainability with SHAP and attention visualization
-
----
-
-## 🎯 Key Features
-
-### 🧠 Multi-Model Ensemble Architecture
-- **LightGBM** for tabular feature interactions with custom WRMSSE objective
-- **Temporal Fusion Transformer (TFT)** for capturing complex temporal patterns
-- **N-BEATS** neural basis expansion for interpretable decomposition
-- **Automated model selection** based on series characteristics
-
-### 🔧 Advanced Feature Engineering
-- **150+ engineered features** including temporal, price, and promotional signals
-- **Recursive feature generation** for multi-step horizon forecasting
-- **Hierarchical aggregation** (Item → Category → Store → Region → Total)
-- **External data integration**: Weather, economic indicators, competitor pricing
-
-### 📈 MLOps & Production Readiness
-- **MLflow** experiment tracking and model registry
-- **Apache Airflow** DAGs for automated daily retraining
-- **FastAPI** serving layer with async prediction endpoints
-- **Prometheus/Grafana** monitoring and alerting
-- **A/B testing framework** for controlled model rollouts
-
-### 🔬 Rigorous Evaluation Framework
-- **Time-series cross-validation** with rolling origin
-- **Hierarchical accuracy metrics** (WRMSSE, MASE, sMAPE)
-- **Statistical significance testing** for model comparison
-- **Automated backtesting reports** with confidence intervals
-
----
-
-## 🏗 System Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           RETAIL DEMAND FORECASTING PLATFORM                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐  │
-│  │   Data      │    │   Feature   │    │   Model     │    │   Serving   │  │
-│  │   Sources   │───▶│   Store     │───▶│   Training  │───▶│   Layer     │  │
-│  └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘  │
-│        │                  │                  │                  │          │
-│        ▼                  ▼                  ▼                  ▼          │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                        INFRASTRUCTURE LAYER                         │   │
-│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────────────┐│   │
-│  │  │  Airflow  │  │  MLflow   │  │  Redis    │  │  Prometheus/      ││   │
-│  │  │  DAGs     │  │  Registry │  │  Cache    │  │  Grafana          ││   │
-│  │  └───────────┘  └───────────┘  └───────────┘  └───────────────────┘│   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Data Flow Architecture
-
-```mermaid
-graph LR
-    A[Raw Sales Data] --> B[Data Validation]
-    B --> C[Feature Engineering]
-    C --> D[Feature Store]
-    D --> E[Model Training]
-    E --> F[Model Registry]
-    F --> G[Model Serving]
-    G --> H[Predictions API]
-    
-    I[Calendar Events] --> C
-    J[Price Data] --> C
-    K[Weather API] --> C
-    
-    E --> L[MLflow Tracking]
-    G --> M[Monitoring]
-```
-
----
-
-## 📁 Project Structure
-
-```
-retail-demand-forecasting-at-scale/
-│
-├── 📂 src/                           # Source code
-│   ├── 📂 data/                      # Data loading and validation
-│   │   ├── __init__.py
-│   │   ├── loader.py                 # Multi-source data ingestion
-│   │   ├── validators.py             # Pydantic data validation schemas
-│   │   ├── preprocessor.py           # Data cleaning and transformation
-│   │   └── synthetic.py              # Synthetic data generation for testing
-│   │
-│   ├── 📂 features/                  # Feature engineering
-│   │   ├── __init__.py
-│   │   ├── temporal.py               # Lag, rolling, calendar features
-│   │   ├── price.py                  # Price elasticity and promotions
-│   │   ├── hierarchical.py           # Cross-level aggregations
-│   │   ├── external.py               # Weather, economic indicators
-│   │   └── store.py                  # Feature store interface
-│   │
-│   ├── 📂 models/                    # Model implementations
-│   │   ├── __init__.py
-│   │   ├── base.py                   # Abstract base forecaster
-│   │   ├── lightgbm_model.py         # LightGBM with custom objectives
-│   │   ├── tft_model.py              # Temporal Fusion Transformer
-│   │   ├── nbeats_model.py           # N-BEATS neural architecture
-│   │   ├── ensemble.py               # Weighted ensemble combiner
-│   │   └── model_selection.py        # Automated model selection
-│   │
-│   ├── 📂 evaluation/                # Metrics and backtesting
-│   │   ├── __init__.py
-│   │   ├── metrics.py                # WRMSSE, MASE, sMAPE implementations
-│   │   ├── backtesting.py            # Time-series CV framework
-│   │   ├── significance.py           # Statistical testing (DM test)
-│   │   └── reports.py                # Automated report generation
-│   │
-│   ├── 📂 serving/                   # Model serving
-│   │   ├── __init__.py
-│   │   ├── api.py                    # FastAPI application
-│   │   ├── schemas.py                # Request/response schemas
-│   │   ├── predictor.py              # Prediction service
-│   │   └── cache.py                  # Redis caching layer
-│   │
-│   ├── 📂 monitoring/                # Observability
-│   │   ├── __init__.py
-│   │   ├── drift_detection.py        # Data and concept drift
-│   │   ├── metrics_collector.py      # Prometheus metrics
-│   │   └── alerting.py               # Alert rules and notifications
-│   │
-│   └── 📂 utils/                     # Utilities
-│       ├── __init__.py
-│       ├── config.py                 # Configuration management
-│       ├── logging.py                # Structured logging
-│       └── decorators.py             # Performance and retry decorators
-│
-├── 📂 pipelines/                     # Orchestration
-│   ├── 📂 airflow/
-│   │   ├── dags/
-│   │   │   ├── daily_training.py     # Daily model retraining DAG
-│   │   │   ├── batch_inference.py    # Batch prediction DAG
-│   │   │   └── data_quality.py       # Data quality checks DAG
-│   │   └── plugins/
-│   │
-│   └── 📂 scripts/
-│       ├── train.py                  # Training entry point
-│       ├── evaluate.py               # Evaluation entry point
-│       └── serve.py                  # Serving entry point
-│
-├── 📂 tests/                         # Test suite
-│   ├── 📂 unit/                      # Unit tests
-│   │   ├── test_features.py
-│   │   ├── test_models.py
-│   │   └── test_metrics.py
-│   ├── 📂 integration/               # Integration tests
-│   │   ├── test_pipeline.py
-│   │   └── test_api.py
-│   └── 📂 fixtures/                  # Test fixtures
-│       └── sample_data.py
-│
-├── 📂 notebooks/                     # Research notebooks
-│   ├── 01_exploratory_analysis.ipynb
-│   ├── 02_feature_engineering.ipynb
-│   ├── 03_model_comparison.ipynb
-│   ├── 04_hyperparameter_tuning.ipynb
-│   └── 05_explainability_dashboard.ipynb
-│
-├── 📂 config/                        # Configuration files
-│   ├── config.yaml                   # Main configuration
-│   ├── model_params.yaml             # Model hyperparameters
-│   ├── features.yaml                 # Feature definitions
-│   └── logging.yaml                  # Logging configuration
-│
-├── 📂 infrastructure/                # IaC and deployment
-│   ├── 📂 docker/
-│   │   ├── Dockerfile.train          # Training container
-│   │   ├── Dockerfile.serve          # Serving container
-│   │   └── docker-compose.yml        # Local development stack
-│   ├── 📂 kubernetes/
-│   │   ├── deployment.yaml
-│   │   └── service.yaml
-│   └── 📂 terraform/                 # Cloud infrastructure
-│       └── main.tf
-│
-├── 📂 docs/                          # Documentation
-│   ├── ARCHITECTURE.md               # System design document
-│   ├── API.md                        # API documentation
-│   ├── DEPLOYMENT.md                 # Deployment guide
-│   └── METHODOLOGY.md                # ML methodology
-│
-├── 📂 data/                          # Data directory (gitignored)
-│   ├── raw/
-│   ├── processed/
-│   └── features/
-│
-├── .github/
-│   └── workflows/
-│       ├── ci.yml                    # Continuous integration
-│       ├── cd.yml                    # Continuous deployment
-│       └── model_validation.yml      # Model validation checks
-│
-├── pyproject.toml                    # Project metadata and dependencies
-├── Makefile                          # Development commands
-├── .pre-commit-config.yaml           # Pre-commit hooks
-├── CONTRIBUTING.md                   # Contribution guidelines
-├── CHANGELOG.md                      # Version history
-├── LICENSE                           # MIT License
-└── README.md                         # This file
-```
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-- Python 3.10+
-- Docker & Docker Compose
-- Make (optional, for convenience commands)
-
-### Option 1: Local Development
+Python 3.11 or 3.12. Runs offline; no API keys, no downloads.
 
 ```bash
-# Clone the repository
 git clone https://github.com/dsugurtuna/retail-demand-forecasting-at-scale.git
 cd retail-demand-forecasting-at-scale
-
-# Create virtual environment
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install dependencies
+python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
-# Run tests to verify setup
-pytest tests/ -v
-
-# Generate synthetic data
-python -m pipelines.scripts.train --generate-data
-
-# Train models
-python -m pipelines.scripts.train --config config/config.yaml
-
-# Start API server
-python -m pipelines.scripts.serve
+python -m src.train --smoke      # synthetic data, under a minute; exit code 1 if a check fails
+pytest                           # full suite, includes the same smoke run
 ```
 
-### Option 2: Docker Deployment
+The smoke run prints a results table (see "Results from the smoke run" below) and writes `artefacts/smoke/` (model, `metrics.json`, `predictions.csv`, `feature_importance.csv`, `run_config.json`).
+
+Serve the model it just trained:
 
 ```bash
-# Build and start all services
-docker-compose up -d
-
-# View logs
-docker-compose logs -f api
-
-# Access services:
-# - API: http://localhost:8000
-# - MLflow UI: http://localhost:5000
-# - Airflow: http://localhost:8080
-# - Prometheus: http://localhost:9090
-# - Grafana: http://localhost:3000
+FORECAST_MODEL_PATH=artefacts/smoke/model uvicorn src.serving.api:app --port 8000
+curl -s -X POST localhost:8000/predict -H 'content-type: application/json' \
+  -d '{"item_id": "FOODS_1_001", "store_id": "CA_1", "forecast_date": "2013-01-05", "price": 2.5}'
 ```
 
-### Option 3: Make Commands
+On the real M5 data (download `sales_train_evaluation.csv`, `calendar.csv` and `sell_prices.csv` from the Kaggle competition into `data/raw/` yourself; the data is not redistributed here):
 
 ```bash
-make install          # Install dependencies
-make test             # Run test suite
-make lint             # Run linters
-make train            # Train models
-make serve            # Start API server
-make docker-build     # Build Docker images
-make docker-up        # Start Docker stack
+python -m src.train --data-dir data/raw --stores CA_1
 ```
+
+That path is tested on synthetic files written in the M5 layout, but no result on the real M5 data has been produced by this code yet, so none is reported.
+
+## Results from the smoke run
+
+Synthetic data only: 21 items x 5 stores x 730 days, generated by `src/data/synthetic.py` with seed 42. These numbers show the pipeline works end to end and that the model finds the signal the generator put in. **They say nothing about accuracy on real retail data.**
+
+Command: `python -m src.train --smoke`. Produced on Linux x86_64, Python 3.12, LightGBM 4.7.0; other platforms or library versions may differ in the last digits.
+
+Holdout: forecast origin 2012-12-30, forecasting the 28 days to 2013-01-27, 105 series, 115 features.
+
+| Forecast | WRMSSE, 12 levels | WRMSSE, item-store level | RMSE | MAE |
+|---|---:|---:|---:|---:|
+| LightGBM (this pipeline) | 0.7172 | 0.7645 | 3.1034 | 1.9624 |
+| Repeat last week | 0.9372 | 1.0538 | 4.2612 | 2.6452 |
+| Mean of last 28 days | 0.9078 | 0.8009 | 3.2607 | 2.0787 |
+
+Rolling-origin backtest, two origins 28 days apart: WRMSSE 0.6298 and 0.7172 (mean 0.6735). The second fold has the same origin as the holdout and reproduces its score, which is a check that the backtest and the holdout see the same data.
+
+Read with care: at the item-store level the model's lead over the 28-day mean is small (0.76 against 0.80). Most of its advantage is at the aggregate levels (total: 0.62 against 1.08), where noise averages out and the weekly pattern that a flat average ignores dominates. Per-level scores are in `metrics.json` under `wrmsse_by_level`.
+
+WRMSSE is scale-free and 0 is perfect. The 12-level score averages the item-store level with 11 aggregate levels (store, department, state, total and so on), as in M5.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[Synthetic or M5 files] --> B[Pandera validation]
+    B --> C[Hide sales after the forecast origin]
+    C --> D[Features: lags, rolling stats,<br/>calendar, price, hierarchy]
+    D --> E[LightGBM, early stopping<br/>on last 28 days]
+    E --> F[Forecast 28 days]
+    F --> G[WRMSSE vs baselines]
+    D --> H[Rolling-origin backtest]
+    E --> I[artefacts/]
+    I --> J[FastAPI skeleton]
+```
+
+More detail, including a module map and the four leakage controls, is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Design decisions
+
+Short version; each is argued in [docs/WHY.md](docs/WHY.md).
+
+- **One global model, not one per series**, because short, sparse series have little to learn from on their own.
+- **Every sales-based feature is at least 28 days old**, so one model forecasts the whole horizon directly, with no recursive feedback of its own errors.
+- **Future sales are hidden before features are built**, so a badly written feature reads nulls, not answers. A test scrambles hidden values and checks no feature changes.
+- **Tweedie objective**, because sales are non-negative counts with many zeros.
+- **WRMSSE at 12 levels**, because it compares slow and fast movers fairly, weights by money, and rewards forecasts that add up where stock decisions are made.
+- **Baselines in every run**, because a score means nothing without "what would the simple rule have done?".
+- **Missing stays missing**; nothing is filled with 0, because 0 sales is a claim.
+- **Metrics go to JSON**, so a run needs no services; any tracker can ingest them later.
+
+## Limitations and what this is not
+
+- **No real-data result yet.** All published numbers are from synthetic data.
+- **The API is a skeleton.** It computes calendar features for the requested date but does not look up recent sales, so every lag, rolling and hierarchical feature reaches the model as missing. Its forecasts are not the ones the training run scores. There is no authentication, rate limiting or TLS.
+- **Prediction intervals are a placeholder**: a fixed ±20% band, not calibrated, coverage never measured.
+- **Only LightGBM is implemented.** The ensemble class combines LightGBM models; there are no deep-learning models. Earlier versions of this README described Temporal Fusion Transformer and N-BEATS models that were never in the code.
+- **Memory.** Features are held in memory as float32. A synthetic run of 2,100 series x 1,941 days (`python -m src.train --synthetic --n-items 210 --n-stores 10 --n-days 1941 --n-estimators 300 --backtest-folds 1`) peaked at 10.2 GB of RAM and took about 9 minutes on 4 shared CPUs. One M5 store has about 45% more rows than that and has not been measured; all 30,490 M5 series (about 14.5 times the rows) will not fit on a standard CI runner. Use `--stores` to train on a subset.
+- **Prices are treated as known through the horizon**, as in M5. In a real business that depends on promotion plans not changing.
+- **Not included:** Airflow or any scheduler beyond GitHub Actions, MLflow or any experiment tracker, Kubernetes manifests, a feature-serving store, monitoring beyond simple request counters. `src/features/store.py` is a local Parquet cache of feature sets, not an online feature store. The Docker files are not built in CI. Earlier versions of this README listed several of these, along with business-impact and benchmark figures that no code in the repository produced; they have been removed (see [CHANGELOG.md](CHANGELOG.md)).
+- The YAML files in `config/` are read by `src/utils/config.py` but not yet by the training command, which takes flags.
+
+## Roadmap
+
+1. Run on the real M5 data for one store; publish the command, scores and baselines, including where the model loses.
+2. Compare horizon-bucketed models (for example days 1-7, 8-14, 15-28) with the single 28-day model in backtests.
+3. Compare the WRMSSE surrogate objective with Tweedie on the same folds.
+4. Quantile or conformal intervals with measured coverage.
+5. A history lookup in the API so it serves the forecasts that training scores.
+6. Build the Docker images in CI; read `config/*.yaml` from the training command.
+
+## Project layout
+
+```
+src/
+  data/         synthetic generator, M5 loader, Pandera validation
+  features/     temporal, price and hierarchical features; local feature cache
+  models/       LightGBM wrapper, ensemble
+  evaluation/   metrics (incl. WRMSSE), rolling-origin backtests
+  serving/      FastAPI skeleton
+  train.py      the training command
+tests/          unit and integration tests (offline, synthetic data)
+docs/           ARCHITECTURE.md, API_REFERENCE.md, WHY.md
+notebooks/      a step-by-step walkthrough on synthetic data
+.github/        CI (lint, types, tests on 3.11 and 3.12) and the training workflow
+```
+
+The weekly **Model Training** workflow runs the smoke run; larger synthetic runs and M5 runs are started by hand, with inputs documented at the top of `.github/workflows/train.yml`.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE). The M5 data is not included and is subject to the Kaggle competition's terms.
 
 ---
 
-## 📡 API Reference
-
-### Prediction Endpoint
-
-```bash
-POST /api/v1/predict
-```
-
-**Request Body:**
-```json
-{
-  "items": [
-    {
-      "item_id": "FOODS_3_090",
-      "store_id": "CA_1",
-      "date": "2024-01-15"
-    }
-  ],
-  "horizon": 28,
-  "include_confidence_intervals": true,
-  "include_feature_contributions": true
-}
-```
-
-**Response:**
-```json
-{
-  "predictions": [
-    {
-      "item_id": "FOODS_3_090",
-      "store_id": "CA_1",
-      "forecasts": [
-        {
-          "date": "2024-01-16",
-          "point_forecast": 12.4,
-          "lower_bound": 8.2,
-          "upper_bound": 16.6,
-          "confidence_level": 0.95
-        }
-      ],
-      "feature_contributions": {
-        "price_elasticity": -2.3,
-        "day_of_week": 1.8,
-        "promotional_effect": 4.2
-      }
-    }
-  ],
-  "model_version": "v2.3.1",
-  "inference_time_ms": 45
-}
-```
-
-### Batch Prediction
-
-```bash
-POST /api/v1/predict/batch
-Content-Type: multipart/form-data
-```
-
-Upload CSV with columns: `item_id`, `store_id`, `date`
-
-### Health Check
-
-```bash
-GET /api/v1/health
-```
-
-### Model Info
-
-```bash
-GET /api/v1/model/info
-```
-
----
-
-## 📊 Performance Benchmarks
-
-### Model Comparison (M5 Validation Set)
-
-| Model | WRMSSE | MAPE | Training Time | Inference (1K items) |
-|-------|--------|------|---------------|---------------------|
-| LightGBM | 0.521 | 9.2% | 12 min | 0.8s |
-| TFT | 0.498 | 8.7% | 4.2 hours | 2.1s |
-| N-BEATS | 0.512 | 8.9% | 2.8 hours | 1.4s |
-| **Ensemble** | **0.487** | **8.4%** | - | 3.2s |
-
-### Scalability
-
-| SKU Count | Daily Forecast Time | Memory Usage |
-|-----------|---------------------|--------------|
-| 10,000 | 2.3 min | 4 GB |
-| 100,000 | 8.7 min | 12 GB |
-| 600,000 | 23 min | 32 GB |
-
----
-
-## 🔬 Methodology
-
-### Feature Engineering Pipeline
-
-```python
-# Example: Hierarchical Feature Generation
-from src.features import TemporalFeatures, PriceFeatures, HierarchicalFeatures
-
-# Configure feature generators
-temporal = TemporalFeatures(
-    lags=[7, 14, 21, 28, 35, 42],
-    rolling_windows=[7, 14, 28, 56, 112],
-    expanding_windows=True
-)
-
-price = PriceFeatures(
-    elasticity_window=28,
-    competitor_price_lag=7
-)
-
-hierarchical = HierarchicalFeatures(
-    levels=['item', 'category', 'store', 'region'],
-    aggregations=['mean', 'std', 'quantile_75']
-)
-```
-
-### Custom WRMSSE Objective
-
-```python
-def wrmsse_objective(preds, train_data):
-    """Custom LightGBM objective for WRMSSE optimization."""
-    labels = train_data.get_label()
-    weights = train_data.get_weight()
-    
-    # Gradient and Hessian for weighted squared error
-    grad = weights * (preds - labels)
-    hess = weights
-    
-    return grad, hess
-```
-
-### Time-Series Cross-Validation
-
-```
-├─────────────────────────────────────────────────────────────────┤
-│ Training Data                                    │ Validation  │
-├─────────────────────────────────────────────────────────────────┤
-
-Fold 1: [──────────────────────────────────────────]  [─────────]
-Fold 2: [──────────────────────────────────────────────]  [─────────]
-Fold 3: [──────────────────────────────────────────────────]  [─────────]
-Fold 4: [──────────────────────────────────────────────────────]  [─────────]
-
-Gap period (28 days) ensures no data leakage from recursive features
-```
-
----
-
-## 📈 Model Explainability
-
-### SHAP Feature Importance
-
-The system provides comprehensive model interpretability through SHAP (SHapley Additive exPlanations) values, enabling stakeholders to understand the key drivers behind each forecast.
-
-**Top Feature Contributions:**
-- `sales_lag_7`: Recent demand momentum
-- `sell_price`: Price elasticity effects
-- `snap_flag`: SNAP benefits calendar impact
-- `rolling_mean_28`: Monthly baseline demand
-- `event_flag`: Holiday and promotional events
-
-### Temporal Attention Visualization
-
-The Temporal Fusion Transformer provides interpretable attention weights showing which historical time steps most influence the forecast.
-
----
-
-## 🔧 Configuration
-
-### Main Configuration (`config/config.yaml`)
-
-```yaml
-data:
-  sources:
-    sales: "s3://bucket/sales/"
-    calendar: "s3://bucket/calendar/"
-    prices: "s3://bucket/prices/"
-  validation:
-    schema_version: "2.0"
-    null_threshold: 0.05
-    
-features:
-  temporal:
-    lags: [7, 14, 21, 28, 35, 42, 49, 56]
-    rolling_windows: [7, 14, 28, 56, 112]
-  price:
-    elasticity_enabled: true
-    competitor_data: true
-  external:
-    weather: true
-    economic_indicators: true
-
-models:
-  ensemble:
-    weights:
-      lightgbm: 0.4
-      tft: 0.35
-      nbeats: 0.25
-    selection_metric: "wrmsse"
-    
-training:
-  cross_validation:
-    n_folds: 5
-    gap_days: 28
-    test_days: 28
-  early_stopping:
-    patience: 50
-    min_delta: 0.0001
-
-serving:
-  batch_size: 1000
-  cache_ttl_seconds: 3600
-  model_warmup: true
-  
-monitoring:
-  drift_detection:
-    enabled: true
-    threshold: 0.1
-    window_days: 7
-```
-
----
-
-## 🧪 Testing
-
-```bash
-# Run all tests
-pytest tests/ -v
-
-# Run with coverage
-pytest tests/ --cov=src --cov-report=html
-
-# Run specific test categories
-pytest tests/unit/ -v
-pytest tests/integration/ -v
-
-# Run performance benchmarks
-pytest tests/ -v --benchmark-only
-```
-
-### Test Coverage Requirements
-- Unit tests: > 90%
-- Integration tests: > 80%
-- All critical paths covered
-
----
-
-## 📦 Deployment
-
-### Kubernetes Deployment
-
-```bash
-# Apply Kubernetes manifests
-kubectl apply -f infrastructure/kubernetes/
-
-# Check deployment status
-kubectl get pods -n forecasting
-
-# View logs
-kubectl logs -f deployment/forecast-api -n forecasting
-```
-
-### CI/CD Pipeline
-
-The GitHub Actions workflow handles:
-1. **Linting & Type Checking** - Black, isort, mypy
-2. **Unit Tests** - pytest with coverage
-3. **Integration Tests** - API and pipeline tests
-4. **Model Validation** - Performance regression checks
-5. **Docker Build** - Multi-stage optimized builds
-6. **Deployment** - Blue-green deployment to Kubernetes
-
----
-
-## 🤝 Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-### Development Setup
-
-```bash
-# Install development dependencies
-pip install -e ".[dev]"
-
-# Install pre-commit hooks
-pre-commit install
-
-# Run linters
-make lint
-
-# Run formatters
-make format
-```
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## 📚 References
-
-- [M5 Forecasting Competition](https://www.kaggle.com/c/m5-forecasting-accuracy)
-- [Temporal Fusion Transformers for Interpretable Multi-horizon Time Series Forecasting](https://arxiv.org/abs/1912.09363)
-- [N-BEATS: Neural basis expansion analysis for interpretable time series forecasting](https://arxiv.org/abs/1905.10437)
-- [LightGBM: A Highly Efficient Gradient Boosting Decision Tree](https://papers.nips.cc/paper/6907-lightgbm-a-highly-efficient-gradient-boosting-decision-tree)
-
----
-
-## 👤 Author
-
-**Ugur Tuna**
-- LinkedIn: [linkedin.com/in/ugurtuna](https://linkedin.com/in/ugurtuna)
-- GitHub: [@dsugurtuna](https://github.com/dsugurtuna)
-
----
-
-<div align="center">
-
-**Built with ❤️ for the retail industry**
-
-*If you find this project useful, please consider giving it a ⭐*
-
-</div>
+Personal project by [Ugur Tuna](https://github.com/dsugurtuna). Not affiliated with or endorsed by any employer.

@@ -308,13 +308,12 @@ class MetricsResult(BaseModel):
 
 class Metrics:
     """
-    Comprehensive metrics calculator for demand forecasting.
+    Point-forecast metrics for one set of forecasts.
 
-    Provides:
-    - Standard regression metrics
-    - Forecasting-specific metrics (MASE, WRMSSE)
-    - Per-series and aggregated metrics
-    - Statistical summaries
+    ``evaluate`` pools all rows (RMSE, MAE, sMAPE, MAPE, optional MASE and
+    WRMSSE); ``evaluate_per_series`` and ``evaluate_by_horizon`` break the
+    errors down. For the M5 metric on long-format data use
+    ``hierarchical_wrmsse``.
 
     Example:
         >>> metrics = Metrics()

@@ -1,11 +1,9 @@
 """
 Structured logging configuration.
 
-Provides production-grade logging with:
-- JSON formatting for production
-- Console formatting for development
-- Log rotation
-- Context injection
+- JSON lines (for files and log collectors) or coloured console output
+- Optional file handler (no rotation)
+- A small context helper for extra fields
 """
 
 from __future__ import annotations
