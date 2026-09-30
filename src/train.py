@@ -182,25 +182,21 @@ def run(config: TrainConfig) -> dict[str, Any]:
         .drop(TARGET)
         .join(data.select(SERIES, DATE, TARGET), on=[SERIES, DATE], how="left")
     )
+    del features  # keep at most one extra copy of the feature matrix alive (memory)
 
     use_surrogate = config.objective == "wrmsse-surrogate"
     sample_weight = None
     if use_surrogate:
-        sample_weight = wrmsse_row_weights(fit_part.to_pandas()).to_numpy()
+        weight_cols = [c for c in (SERIES, DATE, TARGET, "sell_price") if c in fit_part.columns]
+        sample_weight = wrmsse_row_weights(fit_part.select(weight_cols).to_pandas()).to_numpy()
 
+    y_fit, y_val = fit_part[TARGET].to_numpy(), val_part[TARGET].to_numpy()
+    X_fit, X_val = to_model_input(fit_part, columns), to_model_input(val_part, columns)
+    del fit_part, val_part
     model = LightGBMForecaster(config=config.model, use_custom_objective=use_surrogate)
-    model.fit(
-        to_model_input(fit_part, columns),
-        fit_part[TARGET].to_numpy(),
-        X_valid=to_model_input(val_part, columns),
-        y_valid=val_part[TARGET].to_numpy(),
-        sample_weight=sample_weight,
-    )
-    X_test = to_model_input(test_part, columns)
-    predictions = np.asarray(model.predict(X_test), dtype=float)
-
-    # Free the training matrices before scoring and backtesting (memory).
-    del features, fit_part, val_part, X_test
+    model.fit(X_fit, y_fit, X_valid=X_val, y_valid=y_val, sample_weight=sample_weight)
+    del X_fit, X_val
+    predictions = np.asarray(model.predict(to_model_input(test_part, columns)), dtype=float)
 
     # Score against the untouched data (feature building may drop constant
     # columns such as state_id, which WRMSSE's hierarchy levels still need).
@@ -220,32 +216,6 @@ def run(config: TrainConfig) -> dict[str, Any]:
     }
     holdout = {"model": score(train_pd, test_pd, predictions)}
     holdout.update({name: score(train_pd, test_pd, p) for name, p in baselines.items()})
-
-    backtest = None
-    if config.backtest_folds:
-        engine = BacktestEngine(
-            BacktestConfig(
-                n_folds=config.backtest_folds,
-                test_days=config.horizon,
-                validation_days=config.validation_days,
-                min_train_days=max(365, config.horizon * 4),
-            )
-        )
-        bt = engine.run(
-            data, model.clone(), FeatureEngineer(FeatureEngineerConfig(min_lag=config.horizon))
-        )
-        backtest = {
-            "folds": [
-                {
-                    "origin": str(f.train_end.date()),
-                    "wrmsse": f.wrmsse,
-                    "rmse": f.metrics.rmse,
-                    "mae": f.metrics.mae,
-                }
-                for f in bt.fold_results
-            ],
-            "mean_wrmsse": bt.mean_wrmsse,
-        }
 
     model_dir = out / "model"
     model.save(model_dir)
@@ -275,7 +245,7 @@ def run(config: TrainConfig) -> dict[str, Any]:
         "features": engineer.get_feature_summary(),
         "best_iteration": model.metadata.metrics.get("best_iteration") if model.metadata else None,
         "holdout": holdout,
-        "backtest": backtest,
+        "backtest": None,
         "validation_warnings": validation.warnings,
     }
 
@@ -283,6 +253,32 @@ def run(config: TrainConfig) -> dict[str, Any]:
         metrics["checks"] = run_checks(
             data, origin, engineer, columns, test_part, predictions, holdout, model, model_dir
         )
+    del test_part, train_pd, test_pd  # release before the backtest builds its own features
+
+    if config.backtest_folds:
+        engine = BacktestEngine(
+            BacktestConfig(
+                n_folds=config.backtest_folds,
+                test_days=config.horizon,
+                validation_days=config.validation_days,
+                min_train_days=max(365, config.horizon * 4),
+            )
+        )
+        bt = engine.run(
+            data, model.clone(), FeatureEngineer(FeatureEngineerConfig(min_lag=config.horizon))
+        )
+        metrics["backtest"] = {
+            "folds": [
+                {
+                    "origin": str(f.train_end.date()),
+                    "wrmsse": f.wrmsse,
+                    "rmse": f.metrics.rmse,
+                    "mae": f.metrics.mae,
+                }
+                for f in bt.fold_results
+            ],
+            "mean_wrmsse": bt.mean_wrmsse,
+        }
 
     metrics["runtime_seconds"] = round(time.time() - started, 1)
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))

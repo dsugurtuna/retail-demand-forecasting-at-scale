@@ -48,7 +48,10 @@ def to_model_input(df: pl.DataFrame, columns: list[str]) -> pd.DataFrame:
     """
     subset = df.select(columns)
     string_cols = [c for c, dtype in subset.schema.items() if dtype in (pl.String, pl.Categorical)]
-    frame = subset.to_pandas()
+    # float32 everywhere else: LightGBM copies the frame into one numeric
+    # array, and a single int64 column would make that copy float64 (2x memory).
+    numeric_cols = [c for c in columns if c not in string_cols]
+    frame = subset.with_columns(pl.col(numeric_cols).cast(pl.Float32)).to_pandas()
     for col in string_cols:
         frame[col] = frame[col].astype("category")
     return frame

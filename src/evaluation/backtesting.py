@@ -233,9 +233,7 @@ class BacktestEngine:
             excluded = NON_FEATURE_COLUMNS | {target_col, date_col, group_col, "id"}
             feature_cols = [c for c in features.columns if c not in excluded]
 
-        in_train = date.is_between(fold_dates["train_start"], fold_dates["train_end"])
         in_test = date.is_between(fold_dates["test_start"], fold_dates["test_end"])
-        train = features.filter(in_train)
         test_actuals = history.filter(in_test).select(group_col, date_col, target_col)
         test = (
             features.filter(in_test)
@@ -244,23 +242,36 @@ class BacktestEngine:
             .sort([group_col, date_col])
         )
 
-        val_start = fold_dates["train_end"] - pd.Timedelta(days=self.config.validation_days - 1)
-        fit_part = train.filter(date < val_start) if self.config.validation_days else train
-        val_part = train.filter(date >= val_start) if self.config.validation_days else None
+        # Slice fit and validation rows straight from the feature frame and
+        # release it, so at most one extra copy of the features is alive.
+        val_days = self.config.validation_days
+        val_start = fold_dates["train_end"] - pd.Timedelta(days=max(val_days, 1) - 1)
+        fit_end = val_start - pd.Timedelta(days=1) if val_days else fold_dates["train_end"]
+        fit_part = features.filter(date.is_between(fold_dates["train_start"], fit_end))
+        val_part = (
+            features.filter(date.is_between(val_start, fold_dates["train_end"]))
+            if val_days
+            else None
+        )
+        del features, masked
+
+        y_fit = fit_part[target_col].to_numpy()
+        y_val = val_part[target_col].to_numpy() if val_part is not None else None
+        X_fit = to_model_input(fit_part, feature_cols)
+        X_val = to_model_input(val_part, feature_cols) if val_part is not None else None
+        train_size = len(fit_part) + (len(val_part) if val_part is not None else 0)
+        del fit_part, val_part
 
         model_instance = model.clone() if hasattr(model, "clone") else copy.deepcopy(model)
-        model_instance.fit(
-            to_model_input(fit_part, feature_cols),
-            fit_part[target_col].to_numpy(),
-            X_valid=to_model_input(val_part, feature_cols) if val_part is not None else None,
-            y_valid=val_part[target_col].to_numpy() if val_part is not None else None,
-        )
+        model_instance.fit(X_fit, y_fit, X_valid=X_val, y_valid=y_val)
+        del X_fit, X_val
 
         predictions = np.maximum(
             np.asarray(model_instance.predict(to_model_input(test, feature_cols)), dtype=float), 0
         )
         y_test = test[target_col].to_numpy()
-        metrics = self._metrics.evaluate(y_test, predictions, y_train=train[target_col].to_numpy())
+        y_train = y_fit if y_val is None else np.concatenate([y_fit, y_val])
+        metrics = self._metrics.evaluate(y_test, predictions, y_train=y_train)
 
         predictions_df = test.select(group_col, date_col, target_col).to_pandas()
         predictions_df["prediction"] = predictions
@@ -291,7 +302,7 @@ class BacktestEngine:
             train_end=fold_dates["train_end"],
             test_start=fold_dates["test_start"],
             test_end=fold_dates["test_end"],
-            train_size=len(train),
+            train_size=train_size,
             test_size=len(test),
             metrics=metrics,
             wrmsse=fold_wrmsse,
