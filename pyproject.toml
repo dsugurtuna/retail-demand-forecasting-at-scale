@@ -115,7 +115,7 @@ plugins = ["pydantic.mypy"]
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
-addopts = ["-ra", "--strict-markers", "--strict-config", "--tb=short"]
+addopts = ["-ra", "--strict-markers", "--strict-config", "--tb=short", "--import-mode=importlib"]
 markers = [
     "slow: slower end-to-end tests (deselect with '-m \"not slow\"')",
 ]

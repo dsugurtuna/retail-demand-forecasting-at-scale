@@ -1,17 +1,25 @@
 """Unit tests for evaluation metrics."""
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from src.evaluation.metrics import (
+    M5_LEVELS,
     Metrics,
     MetricsResult,
+    hierarchical_wrmsse,
     mae,
     mape,
     mase,
     rmse,
+    series_scales,
     smape,
+    wrmsse,
+    wrmsse_row_weights,
 )
+
+RNG = np.random.default_rng(123)
 
 
 class TestBasicMetrics:
@@ -103,7 +111,7 @@ class TestMetricsClass:
     def test_evaluate_with_training_data(self, sample_predictions):
         """Evaluate should compute MASE when training data provided."""
         y_true, y_pred = sample_predictions
-        y_train = np.random.exponential(10, 200)
+        y_train = RNG.exponential(10, 200)
 
         metrics = Metrics()
         result = metrics.evaluate(y_true, y_pred, y_train=y_train)
@@ -113,13 +121,11 @@ class TestMetricsClass:
 
     def test_evaluate_per_series(self):
         """Evaluate per series should return DataFrame."""
-        import pandas as pd
-
         df = pd.DataFrame(
             {
                 "id": ["A"] * 50 + ["B"] * 50,
-                "sales": np.random.exponential(10, 100),
-                "prediction": np.random.exponential(10, 100),
+                "sales": RNG.exponential(10, 100),
+                "prediction": RNG.exponential(10, 100),
             }
         )
 
@@ -132,13 +138,11 @@ class TestMetricsClass:
 
     def test_evaluate_by_horizon(self):
         """Evaluate by horizon should return DataFrame."""
-        import pandas as pd
-
         df = pd.DataFrame(
             {
                 "horizon": np.repeat([1, 7, 14, 28], 25),
-                "sales": np.random.exponential(10, 100),
-                "prediction": np.random.exponential(10, 100),
+                "sales": RNG.exponential(10, 100),
+                "prediction": RNG.exponential(10, 100),
             }
         )
 
@@ -153,7 +157,7 @@ class TestMetricsClass:
         y_true, y_pred = sample_predictions
 
         # Create worse predictions
-        y_pred_worse = y_pred + np.random.normal(0, 5, len(y_pred))
+        y_pred_worse = y_pred + RNG.normal(0, 5, len(y_pred))
 
         metrics = Metrics()
         result = metrics.compare_models(
@@ -217,3 +221,77 @@ class TestMetricsResult:
         assert result.mape is None
         assert result.mase is None
         assert result.wrmsse is None
+
+
+class TestWRMSSE:
+    """WRMSSE as defined for the M5 accuracy competition."""
+
+    def test_series_scale_starts_at_first_sale(self):
+        # Leading zeros are ignored: diffs of [1, 3, 2] are 2 and -1 -> (4 + 1) / 2.
+        scales = series_scales(np.array([[0, 0, 1, 3, 2], [1, 1, 1, 1, 1]]))
+        assert scales == pytest.approx([2.5, 0.0])
+
+    def test_perfect_forecast_scores_zero(self):
+        y = np.array([[1.0, 2.0], [3.0, 4.0]])
+        assert wrmsse(y, y, [0.5, 0.5], [1.0, 1.0]) == pytest.approx(0.0)
+
+    def test_hand_computed_value(self):
+        # Series A: errors (1, 1), scale 4 -> RMSSE 0.5. Series B: errors (2, 0),
+        # scale 1 -> RMSSE sqrt(2). Weights 0.75 / 0.25.
+        actual = np.array([[1.0, 2.0], [3.0, 4.0]])
+        forecast = np.array([[2.0, 3.0], [5.0, 4.0]])
+        expected = 0.75 * 0.5 + 0.25 * np.sqrt(2.0)
+        assert wrmsse(actual, forecast, [0.75, 0.25], [4.0, 1.0]) == pytest.approx(expected)
+
+    def test_zero_scale_series_are_left_out(self):
+        actual = np.array([[1.0, 2.0], [3.0, 4.0]])
+        forecast = np.array([[2.0, 3.0], [9.0, 9.0]])
+        # Series B has scale 0, so only A counts and its weight becomes 1.
+        assert wrmsse(actual, forecast, [0.5, 0.5], [4.0, 0.0]) == pytest.approx(0.5)
+
+    def test_shape_mismatch_raises(self):
+        with pytest.raises(ValueError):
+            wrmsse(np.ones((2, 3)), np.ones((2, 2)), [0.5, 0.5], [1, 1])
+
+    def test_hierarchical_perfect_and_naive(self, m5_data):
+        df = m5_data.to_pandas()
+        origin = df["date"].max() - pd.Timedelta(days=28)
+        train, test = df[df["date"] <= origin], df[df["date"] > origin].copy()
+
+        perfect = hierarchical_wrmsse(train, test.assign(prediction=test["sales"]))
+        assert perfect["wrmsse"] == pytest.approx(0.0)
+        assert set(perfect["levels"]) == {name for name, _ in M5_LEVELS}
+
+        zeros = hierarchical_wrmsse(train, test.assign(prediction=0.0))
+        assert zeros["wrmsse"] > 0.5
+
+    def test_series_level_matches_direct_computation(self, m5_data):
+        df = m5_data.to_pandas()
+        origin = df["date"].max() - pd.Timedelta(days=28)
+        train, test = df[df["date"] <= origin], df[df["date"] > origin].copy()
+        test["prediction"] = test.groupby("id")["sales"].transform("mean")
+
+        result = hierarchical_wrmsse(train, test, levels=[("series", ["id"])])
+
+        history = train.pivot(index="id", columns="date", values="sales")
+        recent = train[train["date"] > origin - pd.Timedelta(days=28)]
+        dollars = (recent["sales"] * recent["sell_price"]).groupby(recent["id"]).sum()
+        dollars = dollars.reindex(history.index)
+        actual = test.pivot(index="id", columns="date", values="sales").reindex(history.index)
+        forecast = test.pivot(index="id", columns="date", values="prediction").reindex(
+            history.index
+        )
+        expected = wrmsse(
+            actual.to_numpy(),
+            forecast.to_numpy(),
+            (dollars / dollars.sum()).to_numpy(),
+            series_scales(history.to_numpy()),
+        )
+        assert result["wrmsse"] == pytest.approx(expected)
+
+    def test_row_weights_average_one(self, m5_data):
+        train = m5_data.to_pandas()
+        weights = wrmsse_row_weights(train)
+        assert len(weights) == len(train)
+        assert weights.mean() == pytest.approx(1.0)
+        assert (weights >= 0).all()
