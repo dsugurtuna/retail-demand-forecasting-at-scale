@@ -1,18 +1,20 @@
 """
-Feature Store for managing computed features.
+A small local feature cache: versioned Parquet files with JSON metadata.
 
-Provides centralized feature storage and retrieval with:
-- Versioning support
-- Point-in-time correctness
-- Feature lineage tracking
-- Caching layer
+Each saved feature set lives in ``<storage_path>/<name>/<version>/`` as
+``features.parquet`` plus ``metadata.json`` (columns, row count, a content hash
+and the parameters used). That is enough to reuse expensive features between
+runs and to see which parameters produced them.
+
+It is not an online feature store: there is no low-latency lookup service, no
+event-time joins and no sharing across machines.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,14 +38,7 @@ class FeatureMetadata(BaseModel):
 
 class FeatureStore:
     """
-    Feature Store for managing computed features.
-
-    Provides:
-    - Centralized feature storage and retrieval
-    - Version control for feature sets
-    - Point-in-time feature retrieval
-    - Caching for performance
-    - Feature lineage tracking
+    Save and load versioned feature sets on the local file system.
 
     Example:
         >>> store = FeatureStore("data/features")
@@ -88,7 +83,7 @@ class FeatureStore:
             Feature metadata
         """
         if version is None:
-            version = datetime.now().strftime("v%Y%m%d_%H%M%S")
+            version = datetime.now(UTC).strftime("v%Y%m%d_%H%M%S")
 
         # Create directory structure
         feature_dir = self.storage_path / name / version
@@ -109,7 +104,7 @@ class FeatureStore:
         metadata = FeatureMetadata(
             name=name,
             version=version,
-            created_at=datetime.now(),
+            created_at=datetime.now(UTC),
             features=list(features.columns),
             row_count=len(features),
             source_hash=self._compute_hash(features),
@@ -117,8 +112,7 @@ class FeatureStore:
         )
 
         metadata_path = feature_dir / "metadata.json"
-        with open(metadata_path, "w") as f:
-            f.write(metadata.model_dump_json(indent=2))
+        metadata_path.write_text(metadata.model_dump_json(indent=2))
 
         # Update cache
         cache_key = f"{name}:{version}"
@@ -191,8 +185,7 @@ class FeatureStore:
         if not metadata_path.exists():
             raise FileNotFoundError(f"Metadata not found for '{name}' v{version}")
 
-        with open(metadata_path) as f:
-            metadata = FeatureMetadata.model_validate_json(f.read())
+        metadata = FeatureMetadata.model_validate_json(metadata_path.read_text())
 
         self._metadata_cache[cache_key] = metadata
         return metadata
@@ -233,21 +226,23 @@ class FeatureStore:
             self._cache.pop(f"{name}:{version}", None)
             self._metadata_cache.pop(f"{name}:{version}", None)
 
-    def get_point_in_time_features(
+    def load_version_as_of(
         self, name: str, as_of_date: datetime, entity_ids: list[str] | None = None
     ) -> pl.DataFrame:
         """
-        Get features as they would have been at a specific point in time.
+        Load the newest version of ``name`` that was saved on or before ``as_of_date``.
 
-        This is crucial for preventing data leakage during backtesting.
+        This selects by when the feature set was *saved*, not by the event dates
+        inside it. It does not filter rows by date and does not by itself stop
+        leakage; the features must already have been built leakage-safe.
 
         Args:
             name: Feature set name
-            as_of_date: Point in time for feature retrieval
-            entity_ids: Specific entities to retrieve
+            as_of_date: Timezone-aware cut-off for the version's ``created_at``
+            entity_ids: Optional series ids to keep
 
         Returns:
-            Features as of the specified date
+            The selected feature set
         """
         # Find the most recent version before as_of_date
         versions = self.list_versions(name)
@@ -282,12 +277,12 @@ class FeatureStore:
         versions = self.list_versions(name)
         if not versions:
             raise FileNotFoundError(f"No versions found for feature set '{name}'")
-        return versions[-1]
+        return max(versions, key=lambda v: self.get_metadata(name, v).created_at)
 
     def _compute_hash(self, df: pl.DataFrame) -> str:
-        """Compute a hash of the DataFrame for lineage tracking."""
-        # Use schema and sample of data for hash
-        schema_str = str(df.schema)
-        sample_str = str(df.head(100).to_pandas().values.tobytes())
-        combined = schema_str + sample_str
-        return hashlib.md5(combined.encode()).hexdigest()
+        """Deterministic fingerprint of the schema, row count and first 1,000 rows."""
+        digest = hashlib.sha256()
+        digest.update(str(df.schema).encode())
+        digest.update(str(len(df)).encode())
+        digest.update(df.head(1000).write_csv().encode())
+        return digest.hexdigest()

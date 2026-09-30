@@ -1,10 +1,13 @@
 """
 Evaluation metrics for demand forecasting.
 
-Implements standard and custom metrics including:
-- RMSE, MAE, MAPE, sMAPE
-- WRMSSE (M5 competition metric)
-- MASE (Mean Absolute Scaled Error)
+- Point metrics: RMSE, MAE, MAPE, sMAPE, MASE.
+- WRMSSE, the M5 accuracy competition metric: ``wrmsse`` for a set of series,
+  ``series_scales`` for the per-series scale, and ``hierarchical_wrmsse`` for
+  the 12-level version used to rank M5 entries.
+
+Reference: the M5 competition page, https://www.kaggle.com/c/m5-forecasting-accuracy
+(see its Evaluation tab and competitors' guide).
 """
 
 from __future__ import annotations
@@ -88,34 +91,191 @@ def wrmsse(
     y_true: np.ndarray, y_pred: np.ndarray, weights: np.ndarray, scales: np.ndarray
 ) -> float:
     """
-    Weighted Root Mean Squared Scaled Error.
+    Weighted root mean squared scaled error across a set of series.
 
-    The M5 competition metric that weights errors by:
-    1. Scale: Based on historical variance
-    2. Weight: Based on dollar sales value
+    For each series i, RMSSE_i = sqrt(mean_h (y - y_hat)^2 / scale_i), where
+    scale_i is the mean squared one-step naive error over that series' training
+    history (see ``series_scales``). The result is sum_i w_i * RMSSE_i.
 
     Args:
-        y_true: Actual values
-        y_pred: Predicted values
-        weights: Item/series weights (sum to 1)
-        scales: Scaling factors for each series
+        y_true: Actuals, shape (n_series, horizon). 1-D input is one series.
+        y_pred: Forecasts, same shape as ``y_true``.
+        weights: Non-negative weight per series, shape (n_series,). Renormalised
+            to sum to 1 over the series that have a positive scale.
+        scales: Scale per series, shape (n_series,). Series with scale 0 (never
+            sold, or constant) have no defined RMSSE and are left out.
 
     Returns:
-        WRMSSE score
+        WRMSSE. 0 is a perfect forecast.
     """
-    # Squared errors
-    squared_errors = (y_true - y_pred) ** 2
+    actual = np.atleast_2d(np.asarray(y_true, dtype=float))
+    forecast = np.atleast_2d(np.asarray(y_pred, dtype=float))
+    w = np.asarray(weights, dtype=float).ravel()
+    sc = np.asarray(scales, dtype=float).ravel()
+    if actual.shape != forecast.shape:
+        raise ValueError(f"y_true {actual.shape} and y_pred {forecast.shape} differ in shape")
+    if not (len(w) == len(sc) == actual.shape[0]):
+        raise ValueError("weights and scales need one value per series (row of y_true)")
 
-    # Scaled squared errors
-    scaled_errors = squared_errors / (scales + 1e-8)
+    valid = sc > 0
+    if not valid.any():
+        raise ValueError("Every series has scale 0; WRMSSE is undefined")
+    rmsse = np.sqrt(np.mean((actual[valid] - forecast[valid]) ** 2, axis=1) / sc[valid])
+    w = w[valid]
+    w = w / w.sum() if w.sum() > 0 else np.full(len(w), 1 / len(w))
+    return float(np.sum(w * rmsse))
 
-    # Root mean squared scaled error per series
-    rmsse_per_series = np.sqrt(np.mean(scaled_errors))
 
-    # Weighted average
-    wrmsse_score = float(np.sum(weights * rmsse_per_series))
+def series_scales(history: np.ndarray) -> np.ndarray:
+    """
+    M5 scale per series: mean squared day-on-day change in the training history,
+    counted from each series' first non-zero sale.
 
-    return wrmsse_score
+    Args:
+        history: Training sales, shape (n_series, n_days), oldest day first.
+
+    Returns:
+        Scale per series, shape (n_series,). 0 where there are fewer than two
+        observations after the first sale.
+    """
+    x = np.atleast_2d(np.nan_to_num(np.asarray(history, dtype=float)))
+    started = np.maximum.accumulate(x != 0, axis=1)
+    pair_counted = started[:, :-1]
+    squared_diffs = np.diff(x, axis=1) ** 2
+    counts = pair_counted.sum(axis=1)
+    totals = (squared_diffs * pair_counted).sum(axis=1)
+    return np.divide(totals, counts, out=np.zeros(len(x)), where=counts > 0)
+
+
+def wrmsse_row_weights(
+    train: pd.DataFrame,
+    series_col: str = "id",
+    date_col: str = "date",
+    target_col: str = "sales",
+    price_col: str = "sell_price",
+    weight_days: int = 28,
+) -> pd.Series:
+    """
+    Per-row training weights w_i / scale_i for the bottom-level WRMSSE surrogate.
+
+    w_i is series i's share of dollar sales over the last ``weight_days`` of
+    ``train``; scale_i is its ``series_scales`` value. Series with scale 0 get
+    weight 0. Weights are rescaled to average 1 over rows, so the learning rate
+    means the same thing as without weights.
+
+    Returns:
+        A Series aligned to ``train.index``.
+    """
+    ordered = train.sort_values([series_col, date_col])
+    history = ordered.pivot_table(
+        index=series_col, columns=date_col, values=target_col, aggfunc="sum"
+    ).sort_index(axis=1)
+    scales = pd.Series(series_scales(history.to_numpy(dtype=float)), index=history.index)
+
+    dates = pd.to_datetime(train[date_col])
+    recent = dates > dates.max() - pd.Timedelta(days=weight_days)
+    price = train[price_col].fillna(0) if price_col in train.columns else 1.0
+    dollars = (train[target_col].fillna(0) * price).where(recent, 0.0)
+    series_weight = dollars.groupby(train[series_col]).sum()
+    if series_weight.sum() > 0:
+        series_weight = series_weight / series_weight.sum()
+    else:
+        series_weight = pd.Series(1.0, index=series_weight.index)
+
+    ratio = (series_weight / scales).where(scales > 0, 0.0).fillna(0.0)
+    row_weights = train[series_col].map(ratio).astype(float)
+    mean = row_weights.mean()
+    return row_weights / mean if mean > 0 else row_weights
+
+
+# The 12 aggregation levels of the M5 accuracy competition. The bottom level
+# ("series") is one item in one store, which is the ``id`` column.
+M5_LEVELS: list[tuple[str, list[str]]] = [
+    ("total", []),
+    ("state", ["state_id"]),
+    ("store", ["store_id"]),
+    ("category", ["cat_id"]),
+    ("department", ["dept_id"]),
+    ("state_category", ["state_id", "cat_id"]),
+    ("state_department", ["state_id", "dept_id"]),
+    ("store_category", ["store_id", "cat_id"]),
+    ("store_department", ["store_id", "dept_id"]),
+    ("item", ["item_id"]),
+    ("item_state", ["item_id", "state_id"]),
+    ("series", ["id"]),
+]
+
+
+def _level_matrix(df: pd.DataFrame, keys: list[str], date_col: str, value_col: str) -> pd.DataFrame:
+    """Sum ``value_col`` per (level key, date) and pivot to one row per aggregated series."""
+    grouped = df.assign(_all="all").groupby([*(keys or ["_all"]), date_col], observed=True)
+    summed = grouped[value_col].sum(min_count=1).rename(value_col).reset_index()
+    return summed.pivot_table(
+        index=keys or ["_all"], columns=date_col, values=value_col, aggfunc="sum", dropna=False
+    ).sort_index(axis=1)
+
+
+def hierarchical_wrmsse(
+    train: pd.DataFrame,
+    evaluation: pd.DataFrame,
+    target_col: str = "sales",
+    prediction_col: str = "prediction",
+    date_col: str = "date",
+    price_col: str = "sell_price",
+    weight_days: int = 28,
+    levels: list[tuple[str, list[str]]] | None = None,
+) -> dict[str, object]:
+    """
+    WRMSSE averaged over hierarchy levels, following the M5 accuracy competition.
+
+    At each level, series are summed to that level (for example all items in a
+    store), scaled by their own training history and weighted by their share of
+    dollar sales (units x price) over the last ``weight_days`` of training.
+    Each level scores sum_i w_i * RMSSE_i; the overall score is the unweighted
+    mean over the levels whose columns exist in the data.
+
+    Args:
+        train: Long-format training rows (history up to the forecast origin).
+        evaluation: Long-format rows for the forecast horizon with actuals in
+            ``target_col`` and forecasts in ``prediction_col``.
+        levels: Override the level list. Defaults to ``M5_LEVELS``.
+
+    Returns:
+        ``{"wrmsse": float, "levels": {level_name: float}}``.
+    """
+    levels = levels if levels is not None else M5_LEVELS
+    usable = [(name, keys) for name, keys in levels if set(keys) <= set(train.columns)]
+    if not usable:
+        raise ValueError("None of the hierarchy levels' columns are present")
+
+    train = train.copy()
+    last_day = pd.to_datetime(train[date_col]).max()
+    recent = pd.to_datetime(train[date_col]) > last_day - pd.Timedelta(days=weight_days)
+    if price_col in train.columns:
+        dollars = train[target_col].fillna(0) * train[price_col].fillna(0)
+    else:
+        dollars = train[target_col].fillna(0)
+    train["_dollars"] = dollars.where(recent, 0.0)
+
+    scores: dict[str, float] = {}
+    for name, keys in usable:
+        history = _level_matrix(train, keys, date_col, target_col)
+        weights = (
+            train.assign(_all="all")
+            .groupby(keys or ["_all"], observed=True)["_dollars"]
+            .sum()
+            .reindex(history.index)
+        )
+        actual = _level_matrix(evaluation, keys, date_col, target_col).reindex(history.index)
+        forecast = _level_matrix(evaluation, keys, date_col, prediction_col).reindex(history.index)
+        scores[name] = wrmsse(
+            actual.to_numpy(dtype=float),
+            forecast.to_numpy(dtype=float),
+            weights.to_numpy(dtype=float),
+            series_scales(history.to_numpy(dtype=float)),
+        )
+
+    return {"wrmsse": float(np.mean(list(scores.values()))), "levels": scores}
 
 
 class MetricsResult(BaseModel):
@@ -247,8 +407,8 @@ class Metrics:
         metrics_list = []
 
         for series_id, group in df.groupby(series_col):
-            y_true = group[actual_col].values
-            y_pred = group[pred_col].values
+            y_true = group[actual_col].to_numpy(dtype=float)
+            y_pred = group[pred_col].to_numpy(dtype=float)
 
             metrics_list.append(
                 {
@@ -286,8 +446,8 @@ class Metrics:
         metrics_list = []
 
         for horizon, group in df.groupby(horizon_col):
-            y_true = group[actual_col].values
-            y_pred = group[pred_col].values
+            y_true = group[actual_col].to_numpy(dtype=float)
+            y_pred = group[pred_col].to_numpy(dtype=float)
 
             metrics_list.append(
                 {

@@ -1,12 +1,14 @@
 """
-Price-based feature engineering for demand forecasting.
+Price features: changes, momentum, promotion flags and relative price position.
 
-Implements features capturing price dynamics including:
-- Price momentum and changes
-- Relative price positioning
-- Promotion detection
-- Price elasticity proxies
-- Competitor price features
+Prices are treated as known in advance for the forecast horizon, as in the M5
+data, where ``sell_prices.csv`` covers the evaluation weeks. That is why price
+features are not shifted by the forecast horizon, unlike target-based features.
+
+``price_percentile`` and ``price_zscore`` use each series' whole price history
+in the frame passed in. In a backtest that frame ends at the test period, so
+prices after the test period are never seen. There are no competitor or
+external price features.
 """
 
 from __future__ import annotations
@@ -34,11 +36,6 @@ class PriceFeaturesConfig(BaseModel):
         default=0.05, description="Threshold for detecting significant price changes"
     )
 
-    # Elasticity estimation
-    elasticity_window: int = Field(
-        default=28, description="Window for price elasticity calculation"
-    )
-
     # Cross-item features
     include_category_prices: bool = Field(
         default=True, description="Include category-level price features"
@@ -56,8 +53,7 @@ class PriceFeatures:
     Generates features capturing:
     - Price changes and momentum
     - Relative price positioning (vs category, store)
-    - Promotion indicators
-    - Price elasticity proxies
+    - Promotion indicators (price well below its rolling median)
 
     Example:
         >>> config = PriceFeaturesConfig()

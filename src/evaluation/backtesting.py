@@ -1,16 +1,31 @@
 """
-Time-series backtesting framework.
+Rolling-origin backtesting.
 
-Implements rigorous backtesting for demand forecasting with:
-- Rolling origin cross-validation
-- Gap periods to prevent leakage
-- Multiple fold strategies
-- Comprehensive reporting
+Each fold picks a forecast origin, trains on data up to that origin and scores
+forecasts for the next ``test_days``. Folds step backwards from the end of the
+data, one test window at a time.
+
+How leakage is prevented, fold by fold:
+
+1. Target values after the origin are replaced with nulls *before* features
+   are built. Lag and rolling features for the test window can then only use
+   what was known at the origin, whatever feature settings are used.
+2. The feature engineer is fitted inside the fold, on the masked data.
+3. Early stopping uses the last ``validation_days`` before the origin, chosen
+   by date, never test rows.
+4. A fresh copy of the model is trained in every fold.
+
+``gap_days`` inserts days between the origin and the test window, to mimic
+data that arrives late. Those days' targets are hidden too. With ``min_lag``
+equal to the horizon, keep ``gap_days`` at 0, otherwise the last test days
+have no lag features at all.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,35 +36,33 @@ import pandas as pd
 import polars as pl
 from pydantic import BaseModel, Field
 
-from src.evaluation.metrics import Metrics, MetricsResult
+from src.evaluation.metrics import Metrics, MetricsResult, hierarchical_wrmsse
+from src.features.engineer import NON_FEATURE_COLUMNS, to_model_input
 
 logger = logging.getLogger(__name__)
 
 
 class BacktestConfig(BaseModel):
-    """Configuration for backtesting."""
+    """Configuration for rolling-origin backtests."""
 
-    n_folds: int = Field(default=5, ge=1, description="Number of CV folds")
-    test_days: int = Field(default=28, ge=1, description="Test period length in days")
-    gap_days: int = Field(default=28, ge=0, description="Gap between train and test")
-    min_train_days: int = Field(default=365, ge=28, description="Minimum training days")
-
-    # Strategy
-    expanding_window: bool = Field(
-        default=True, description="Use expanding (True) or sliding (False) window"
+    n_folds: int = Field(default=5, ge=1, description="Number of forecast origins")
+    test_days: int = Field(default=28, ge=1, description="Forecast horizon per fold")
+    gap_days: int = Field(
+        default=0, ge=0, description="Hidden days between the origin and the test window"
     )
-
-    # Feature regeneration
-    regenerate_features: bool = Field(default=True, description="Regenerate features for each fold")
-
-    # Evaluation
-    evaluate_per_series: bool = Field(default=False)
+    min_train_days: int = Field(default=365, ge=28, description="Training length when sliding")
+    expanding_window: bool = Field(
+        default=True, description="Train from the start of the data (True) or a sliding window"
+    )
+    validation_days: int = Field(
+        default=28, ge=0, description="Days before the origin held out for early stopping"
+    )
     evaluate_by_horizon: bool = Field(default=True)
 
 
 @dataclass
 class FoldResult:
-    """Results from a single backtest fold."""
+    """Results from one fold."""
 
     fold_id: int
     train_start: datetime
@@ -59,13 +72,14 @@ class FoldResult:
     train_size: int
     test_size: int
     metrics: MetricsResult
+    wrmsse: float | None = None
     predictions: pd.DataFrame | None = None
-    model_metadata: dict | None = None
+    model_metadata: dict[str, Any] | None = None
 
 
 @dataclass
 class BacktestResult:
-    """Complete backtest results."""
+    """Results from a full backtest."""
 
     config: BacktestConfig
     fold_results: list[FoldResult]
@@ -74,35 +88,22 @@ class BacktestResult:
     metrics_by_horizon: pd.DataFrame | None = None
     total_time_seconds: float = 0.0
 
+    @property
+    def mean_wrmsse(self) -> float | None:
+        values = [f.wrmsse for f in self.fold_results if f.wrmsse is not None]
+        return float(np.mean(values)) if values else None
+
 
 class BacktestEngine:
-    """
-    Time-series backtesting engine.
-
-    Implements production-grade backtesting with:
-    - Rolling origin cross-validation
-    - Gap periods to prevent data leakage
-    - Expanding or sliding windows
-    - Comprehensive metrics and reporting
+    """Run rolling-origin backtests for any model with ``fit``/``predict``.
 
     Example:
-        >>> config = BacktestConfig(n_folds=5, test_days=28, gap_days=28)
-        >>> engine = BacktestEngine(config)
-        >>> results = engine.run(
-        ...     data=df,
-        ...     model=LightGBMForecaster(),
-        ...     feature_engineer=FeatureEngineer()
-        ... )
-        >>> print(results.aggregate_metrics)
+        >>> engine = BacktestEngine(BacktestConfig(n_folds=3))
+        >>> result = engine.run(data, LightGBMForecaster(), FeatureEngineer())
+        >>> result.mean_wrmsse
     """
 
     def __init__(self, config: BacktestConfig | None = None) -> None:
-        """
-        Initialize backtest engine.
-
-        Args:
-            config: Backtest configuration
-        """
         self.config = config or BacktestConfig()
         self._metrics = Metrics()
 
@@ -114,129 +115,86 @@ class BacktestEngine:
         target_col: str = "sales",
         date_col: str = "date",
         group_col: str = "id",
-        callbacks: list[Callable] | None = None,
+        callbacks: list[Callable[[FoldResult], None]] | None = None,
     ) -> BacktestResult:
-        """
-        Run backtesting.
+        """Run every fold and aggregate the results."""
+        start = time.time()
+        frame = pl.from_pandas(data) if isinstance(data, pd.DataFrame) else data
+        frame = frame.with_columns(pl.col(date_col).cast(pl.Datetime("us")))
 
-        Args:
-            data: Full dataset
-            model: Forecasting model (with fit/predict interface)
-            feature_engineer: Feature engineering pipeline
-            target_col: Target column name
-            date_col: Date column name
-            group_col: Group/series column name
-            callbacks: Optional callbacks after each fold
+        min_lag = getattr(getattr(feature_engineer, "config", None), "min_lag", None)
+        horizon = self.config.gap_days + self.config.test_days
+        if min_lag is not None and horizon > min_lag:
+            logger.warning(
+                "gap_days + test_days = %d exceeds min_lag = %d: the last test days "
+                "will have no lag features",
+                horizon,
+                min_lag,
+            )
 
-        Returns:
-            BacktestResult with all metrics and details
-        """
-        import time
-
-        start_time = time.time()
-
-        logger.info(
-            f"Starting backtest with {self.config.n_folds} folds, "
-            f"{self.config.test_days} day test periods"
-        )
-
-        # Convert to pandas for easier manipulation
-        if isinstance(data, pl.DataFrame):
-            df = data.to_pandas()
-        else:
-            df = data.copy()
-
-        # Ensure date column is datetime
-        df[date_col] = pd.to_datetime(df[date_col])
-
-        # Generate fold splits
-        folds = self._generate_folds(df, date_col)
-
+        folds = self._generate_folds(frame, date_col)
         fold_results = []
-        all_predictions = []
-
         for fold_id, fold_dates in enumerate(folds):
-            logger.info(f"\n{'=' * 60}")
-            logger.info(f"Running Fold {fold_id + 1}/{self.config.n_folds}")
-            logger.info(f"{'=' * 60}")
-
-            fold_result = self._run_fold(
-                df=df,
-                model=model,
-                feature_engineer=feature_engineer,
-                fold_id=fold_id,
-                fold_dates=fold_dates,
-                target_col=target_col,
-                date_col=date_col,
-                group_col=group_col,
+            logger.info(
+                "Fold %d/%d: origin %s, test %s to %s",
+                fold_id + 1,
+                len(folds),
+                fold_dates["train_end"].date(),
+                fold_dates["test_start"].date(),
+                fold_dates["test_end"].date(),
             )
+            result = self._run_fold(
+                frame, model, feature_engineer, fold_id, fold_dates, target_col, date_col, group_col
+            )
+            fold_results.append(result)
+            for callback in callbacks or []:
+                callback(result)
 
-            fold_results.append(fold_result)
+        if not fold_results:
+            raise ValueError("No valid folds: not enough history for this configuration")
 
-            if fold_result.predictions is not None:
-                all_predictions.append(fold_result.predictions)
-
-            logger.info(f"Fold {fold_id + 1} RMSE: {fold_result.metrics.rmse:.4f}")
-
-            # Run callbacks
-            if callbacks:
-                for callback in callbacks:
-                    callback(fold_result)
-
-        # Aggregate results
-        aggregate_metrics = self._aggregate_metrics(fold_results)
-        metrics_by_fold = self._create_fold_summary(fold_results)
-
-        # Metrics by horizon if requested
         metrics_by_horizon = None
-        if self.config.evaluate_by_horizon and all_predictions:
-            combined_preds = pd.concat(all_predictions, ignore_index=True)
+        predictions = [f.predictions for f in fold_results if f.predictions is not None]
+        if self.config.evaluate_by_horizon and predictions:
             metrics_by_horizon = self._metrics.evaluate_by_horizon(
-                combined_preds, actual_col=target_col, pred_col="prediction"
+                pd.concat(predictions, ignore_index=True), actual_col=target_col
             )
 
-        total_time = time.time() - start_time
-
-        result = BacktestResult(
+        backtest = BacktestResult(
             config=self.config,
             fold_results=fold_results,
-            aggregate_metrics=aggregate_metrics,
-            metrics_by_fold=metrics_by_fold,
+            aggregate_metrics=self._aggregate_metrics(fold_results),
+            metrics_by_fold=self._fold_summary(fold_results),
             metrics_by_horizon=metrics_by_horizon,
-            total_time_seconds=total_time,
+            total_time_seconds=time.time() - start,
         )
+        logger.info(
+            "Backtest finished in %.1fs: RMSE %.4f, mean WRMSSE %s",
+            backtest.total_time_seconds,
+            backtest.aggregate_metrics.rmse,
+            f"{backtest.mean_wrmsse:.4f}" if backtest.mean_wrmsse is not None else "n/a",
+        )
+        return backtest
 
-        logger.info(f"\nBacktest completed in {total_time:.2f}s")
-        logger.info(f"Average RMSE: {aggregate_metrics.rmse:.4f}")
-        logger.info(f"Average SMAPE: {aggregate_metrics.smape:.2f}%")
-
-        return result
-
-    def _generate_folds(self, df: pd.DataFrame, date_col: str) -> list[dict]:
-        """Generate fold date ranges."""
-        max_date = df[date_col].max()
-        min_date = df[date_col].min()
+    def _generate_folds(self, frame: pl.DataFrame, date_col: str) -> list[dict[str, datetime]]:
+        """Fold date ranges, oldest first."""
+        cfg = self.config
+        min_date = frame[date_col].min()
+        max_date = frame[date_col].max()
+        assert isinstance(min_date, datetime) and isinstance(max_date, datetime)
+        day = pd.Timedelta(days=1)
 
         folds = []
-
-        for fold_id in range(self.config.n_folds):
-            # Calculate dates working backwards from max_date
-            test_end = max_date - pd.Timedelta(days=fold_id * self.config.test_days)
-            test_start = test_end - pd.Timedelta(days=self.config.test_days - 1)
-
-            train_end = test_start - pd.Timedelta(days=self.config.gap_days + 1)
-
-            if self.config.expanding_window:
-                train_start = min_date
-            else:
-                # Sliding window
-                train_start = train_end - pd.Timedelta(days=self.config.min_train_days)
-
-            # Validate fold
-            if train_start >= train_end:
-                logger.warning(f"Skipping fold {fold_id}: insufficient training data")
+        for k in range(cfg.n_folds):
+            test_end = max_date - k * cfg.test_days * day
+            test_start = test_end - (cfg.test_days - 1) * day
+            train_end = test_start - (cfg.gap_days + 1) * day
+            train_start = (
+                min_date if cfg.expanding_window else train_end - (cfg.min_train_days - 1) * day
+            )
+            if train_start < min_date or train_end - train_start < cfg.validation_days * day:
+                logger.warning("Skipping fold %d: not enough training history", k + 1)
                 continue
-
             folds.append(
                 {
                     "train_start": train_start,
@@ -245,202 +203,138 @@ class BacktestEngine:
                     "test_end": test_end,
                 }
             )
-
-            logger.info(
-                f"Fold {fold_id + 1}: Train [{train_start.date()} - {train_end.date()}], "
-                f"Test [{test_start.date()} - {test_end.date()}]"
-            )
-
-        return folds
+        return list(reversed(folds))
 
     def _run_fold(
         self,
-        df: pd.DataFrame,
+        frame: pl.DataFrame,
         model: Any,
         feature_engineer: Any | None,
         fold_id: int,
-        fold_dates: dict,
+        fold_dates: dict[str, datetime],
         target_col: str,
         date_col: str,
         group_col: str,
     ) -> FoldResult:
-        """Run a single backtest fold."""
-        # Split data
-        train_mask = (df[date_col] >= fold_dates["train_start"]) & (
-            df[date_col] <= fold_dates["train_end"]
+        date = pl.col(date_col)
+        history = frame.filter(date <= fold_dates["test_end"])
+        masked = history.with_columns(
+            pl.when(date > fold_dates["train_end"])
+            .then(None)
+            .otherwise(pl.col(target_col))
+            .alias(target_col)
         )
-        test_mask = (df[date_col] >= fold_dates["test_start"]) & (
-            df[date_col] <= fold_dates["test_end"]
-        )
 
-        train_df = df[train_mask].copy()
-        test_df = df[test_mask].copy()
-
-        # Generate features if feature engineer provided
-        if feature_engineer is not None and self.config.regenerate_features:
-            logger.info("Generating features for this fold...")
-
-            # Fit on training data only
-            feature_engineer.fit(pl.from_pandas(train_df))
-
-            train_features = feature_engineer.transform(pl.from_pandas(train_df)).to_pandas()
-            test_features = feature_engineer.transform(pl.from_pandas(test_df)).to_pandas()
+        if feature_engineer is not None:
+            features = feature_engineer.fit_transform(masked)
+            feature_cols = feature_engineer.get_feature_names()
         else:
-            train_features = train_df
-            test_features = test_df
+            features = masked
+            excluded = NON_FEATURE_COLUMNS | {target_col, date_col, group_col, "id"}
+            feature_cols = [c for c in features.columns if c not in excluded]
 
-        # Prepare X and y
-        exclude_cols = {target_col, group_col, date_col, "d", "wm_yr_wk", "id"}
-        feature_cols = [c for c in train_features.columns if c not in exclude_cols]
-
-        X_train = train_features[feature_cols]
-        y_train = train_features[target_col]
-        X_test = test_features[feature_cols]
-        y_test = test_features[target_col]
-
-        # Handle categorical features
-        cat_cols = X_train.select_dtypes(include=["object", "category"]).columns.tolist()
-        for col in cat_cols:
-            X_train[col] = X_train[col].astype("category")
-            X_test[col] = X_test[col].astype("category")
-
-        # Train model
-        logger.info(f"Training on {len(X_train):,} samples...")
-
-        # Create a fresh model instance for this fold
-        model_instance = (
-            model.__class__(**model.get_params().get("hyperparameters", {}))
-            if hasattr(model, "get_params")
-            else model
+        in_train = date.is_between(fold_dates["train_start"], fold_dates["train_end"])
+        in_test = date.is_between(fold_dates["test_start"], fold_dates["test_end"])
+        train = features.filter(in_train)
+        test_actuals = history.filter(in_test).select(group_col, date_col, target_col)
+        test = (
+            features.filter(in_test)
+            .drop(target_col)
+            .join(test_actuals, on=[group_col, date_col], how="left")
+            .sort([group_col, date_col])
         )
 
-        # Fit with validation
-        if hasattr(model_instance, "fit"):
-            # Use last portion of training data as validation
-            val_size = min(len(X_train) // 5, self.config.test_days * len(df[group_col].unique()))
-            X_val = X_train.iloc[-val_size:]
-            y_val = y_train.iloc[-val_size:]
-            X_train_fit = X_train.iloc[:-val_size]
-            y_train_fit = y_train.iloc[:-val_size]
+        val_start = fold_dates["train_end"] - pd.Timedelta(days=self.config.validation_days - 1)
+        fit_part = train.filter(date < val_start) if self.config.validation_days else train
+        val_part = train.filter(date >= val_start) if self.config.validation_days else None
 
-            model_instance.fit(
-                X_train_fit,
-                y_train_fit,
-                X_valid=X_val,
-                y_valid=y_val,
-                categorical_features=cat_cols if cat_cols else None,
-            )
+        model_instance = model.clone() if hasattr(model, "clone") else copy.deepcopy(model)
+        model_instance.fit(
+            to_model_input(fit_part, feature_cols),
+            fit_part[target_col].to_numpy(),
+            X_valid=to_model_input(val_part, feature_cols) if val_part is not None else None,
+            y_valid=val_part[target_col].to_numpy() if val_part is not None else None,
+        )
 
-        # Predict
-        logger.info(f"Predicting {len(X_test):,} samples...")
-        predictions = model_instance.predict(X_test)
+        predictions = np.maximum(
+            np.asarray(model_instance.predict(to_model_input(test, feature_cols)), dtype=float), 0
+        )
+        y_test = test[target_col].to_numpy()
+        metrics = self._metrics.evaluate(y_test, predictions, y_train=train[target_col].to_numpy())
 
-        # Evaluate
-        metrics = self._metrics.evaluate(y_test.values, predictions, y_train=y_train.values)
-
-        # Create predictions DataFrame
-        predictions_df = test_df[[group_col, date_col, target_col]].copy()
+        predictions_df = test.select(group_col, date_col, target_col).to_pandas()
         predictions_df["prediction"] = predictions
         predictions_df["fold"] = fold_id
-
-        # Add horizon (days from test start)
         predictions_df["horizon"] = (
-            predictions_df[date_col] - fold_dates["test_start"]
+            predictions_df[date_col] - pd.Timestamp(fold_dates["test_start"])
         ).dt.days + 1
 
+        # Score on the untouched rows: feature building may have dropped
+        # constant columns (such as state_id) that WRMSSE levels still need.
+        fold_wrmsse = None
+        eval_frame = history.filter(in_test).sort([group_col, date_col]).to_pandas()
+        if (eval_frame[group_col].to_numpy() == test[group_col].to_numpy()).all():
+            eval_frame["prediction"] = predictions
+            train_history = history.filter(date <= fold_dates["train_end"]).to_pandas()
+            try:
+                scores = hierarchical_wrmsse(
+                    train_history, eval_frame, target_col=target_col, date_col=date_col
+                )
+                fold_wrmsse = float(scores["wrmsse"])  # type: ignore[arg-type]
+            except (ValueError, KeyError) as exc:
+                logger.warning("WRMSSE not computed for fold %d: %s", fold_id + 1, exc)
+
+        metadata = getattr(model_instance, "metadata", None)
         return FoldResult(
             fold_id=fold_id,
             train_start=fold_dates["train_start"],
             train_end=fold_dates["train_end"],
             test_start=fold_dates["test_start"],
             test_end=fold_dates["test_end"],
-            train_size=len(train_df),
-            test_size=len(test_df),
+            train_size=len(train),
+            test_size=len(test),
             metrics=metrics,
+            wrmsse=fold_wrmsse,
             predictions=predictions_df,
-            model_metadata=model_instance.metadata.model_dump()
-            if hasattr(model_instance, "metadata") and model_instance.metadata
-            else None,
+            model_metadata=metadata.model_dump() if metadata is not None else None,
         )
 
-    def _aggregate_metrics(self, fold_results: list[FoldResult]) -> MetricsResult:
-        """Aggregate metrics across folds."""
-        rmse_values = [f.metrics.rmse for f in fold_results]
-        mae_values = [f.metrics.mae for f in fold_results]
-        smape_values = [f.metrics.smape for f in fold_results]
+    @staticmethod
+    def _aggregate_metrics(fold_results: list[FoldResult]) -> MetricsResult:
+        """Test-size-weighted averages of the per-fold metrics."""
+        sizes = np.array([f.test_size for f in fold_results], dtype=float)
 
-        # Weighted average by test size
-        total_test_size = sum(f.test_size for f in fold_results)
+        def weighted(values: list[float]) -> float:
+            return float(np.average(values, weights=sizes))
 
-        weighted_rmse = sum(f.metrics.rmse * f.test_size for f in fold_results) / total_test_size
-
-        weighted_mae = sum(f.metrics.mae * f.test_size for f in fold_results) / total_test_size
-
-        weighted_smape = sum(f.metrics.smape * f.test_size for f in fold_results) / total_test_size
-
+        mapes = [f.metrics.mape for f in fold_results if f.metrics.mape is not None]
         return MetricsResult(
-            rmse=weighted_rmse,
-            mae=weighted_mae,
-            smape=weighted_smape,
-            mape=np.mean([f.metrics.mape for f in fold_results if f.metrics.mape is not None]),
-            mean_prediction=np.mean([f.metrics.mean_prediction for f in fold_results]),
-            std_prediction=np.mean([f.metrics.std_prediction for f in fold_results]),
-            mean_actual=np.mean([f.metrics.mean_actual for f in fold_results]),
-            std_actual=np.mean([f.metrics.std_actual for f in fold_results]),
+            rmse=weighted([f.metrics.rmse for f in fold_results]),
+            mae=weighted([f.metrics.mae for f in fold_results]),
+            smape=weighted([f.metrics.smape for f in fold_results]),
+            mape=float(np.mean(mapes)) if mapes else None,
+            mean_prediction=float(np.mean([f.metrics.mean_prediction for f in fold_results])),
+            std_prediction=float(np.mean([f.metrics.std_prediction for f in fold_results])),
+            mean_actual=float(np.mean([f.metrics.mean_actual for f in fold_results])),
+            std_actual=float(np.mean([f.metrics.std_actual for f in fold_results])),
         )
 
-    def _create_fold_summary(self, fold_results: list[FoldResult]) -> pd.DataFrame:
-        """Create summary DataFrame of fold results."""
-        records = []
-
-        for f in fold_results:
-            records.append(
-                {
-                    "fold": f.fold_id + 1,
-                    "train_start": f.train_start,
-                    "train_end": f.train_end,
-                    "test_start": f.test_start,
-                    "test_end": f.test_end,
-                    "train_size": f.train_size,
-                    "test_size": f.test_size,
-                    "rmse": f.metrics.rmse,
-                    "mae": f.metrics.mae,
-                    "smape": f.metrics.smape,
-                    "mape": f.metrics.mape,
-                }
-            )
-
-        df = pd.DataFrame(records)
-
-        # Add summary row
-        summary = pd.DataFrame(
-            [
-                {
-                    "fold": "Average",
-                    "rmse": df["rmse"].mean(),
-                    "mae": df["mae"].mean(),
-                    "smape": df["smape"].mean(),
-                    "mape": df["mape"].mean() if df["mape"].notna().any() else None,
-                }
-            ]
-        )
-
-        return pd.concat([df, summary], ignore_index=True)
-
-
-class Evaluator:
-    """Legacy evaluator class for backward compatibility."""
-
-    def __init__(self, train_df=None, valid_df=None, weights=None):
-        self.train_df = train_df
-        self.valid_df = valid_df
-        self.weights = weights
-        self._metrics = Metrics()
-
-    def generate_report(self, y_true, y_pred):
-        result = self._metrics.evaluate(np.array(y_true), np.array(y_pred))
-        return {
-            "RMSE": result.rmse,
-            "MAE": result.mae,
-            "SMAPE": result.smape,
-        }
+    @staticmethod
+    def _fold_summary(fold_results: list[FoldResult]) -> pd.DataFrame:
+        records = [
+            {
+                "fold": f.fold_id + 1,
+                "train_start": f.train_start,
+                "train_end": f.train_end,
+                "test_start": f.test_start,
+                "test_end": f.test_end,
+                "train_size": f.train_size,
+                "test_size": f.test_size,
+                "rmse": f.metrics.rmse,
+                "mae": f.metrics.mae,
+                "smape": f.metrics.smape,
+                "wrmsse": f.wrmsse,
+            }
+            for f in fold_results
+        ]
+        return pd.DataFrame(records)
