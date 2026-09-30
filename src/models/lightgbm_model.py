@@ -182,7 +182,6 @@ class LightGBMForecaster(BaseForecaster):
             label=y_train,
             weight=sample_weight,
             categorical_feature=cat_features if cat_features else "auto",
-            free_raw_data=False,
         )
 
         valid_sets = [train_set]
@@ -194,7 +193,6 @@ class LightGBMForecaster(BaseForecaster):
                 label=y_valid,
                 reference=train_set,
                 categorical_feature=cat_features if cat_features else "auto",
-                free_raw_data=False,
             )
             valid_sets.append(valid_set)
             valid_names.append("valid")
@@ -232,6 +230,8 @@ class LightGBMForecaster(BaseForecaster):
             callbacks=default_callbacks,
         )
 
+        # Keep the trained trees, drop the binned training data they came from.
+        self._booster.free_dataset()
         self._model = self._booster
         self._is_fitted = True
 

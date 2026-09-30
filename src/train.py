@@ -51,6 +51,17 @@ from src.utils.logging import setup_logging
 logger = logging.getLogger(__name__)
 
 TARGET, DATE, SERIES = "sales", "date", "id"
+SCORING_COLUMNS = [
+    SERIES,
+    "item_id",
+    "dept_id",
+    "cat_id",
+    "store_id",
+    "state_id",
+    DATE,
+    TARGET,
+    "sell_price",
+]
 
 # 21 items x 5 stores (two states) x 2 years: small, but every hierarchy level exists.
 SMOKE_DATA = SyntheticDataConfig(n_items=21, n_stores=5, n_days=730, random_seed=42)
@@ -188,10 +199,14 @@ def run(config: TrainConfig) -> dict[str, Any]:
     X_test = to_model_input(test_part, columns)
     predictions = np.asarray(model.predict(X_test), dtype=float)
 
+    # Free the training matrices before scoring and backtesting (memory).
+    del features, fit_part, val_part, X_test
+
     # Score against the untouched data (feature building may drop constant
     # columns such as state_id, which WRMSSE's hierarchy levels still need).
-    train_pd = data.filter(pl.col(DATE) <= origin).drop("d").to_pandas()
-    test_pd = data.filter(pl.col(DATE) > origin).sort([SERIES, DATE]).drop("d").to_pandas()
+    scoring = data.select([c for c in SCORING_COLUMNS if c in data.columns])
+    train_pd = scoring.filter(pl.col(DATE) <= origin).to_pandas()
+    test_pd = scoring.filter(pl.col(DATE) > origin).sort([SERIES, DATE]).to_pandas()
     if not (
         test_pd[SERIES].to_numpy() == test_part[SERIES].to_numpy()
     ).all():  # pragma: no cover - guards against a silent misalignment
@@ -266,7 +281,7 @@ def run(config: TrainConfig) -> dict[str, Any]:
 
     if config.run_checks:
         metrics["checks"] = run_checks(
-            data, origin, engineer, columns, features, predictions, holdout, model, model_dir
+            data, origin, engineer, columns, test_part, predictions, holdout, model, model_dir
         )
 
     metrics["runtime_seconds"] = round(time.time() - started, 1)
@@ -279,7 +294,7 @@ def run_checks(
     origin: date,
     engineer: FeatureEngineer,
     columns: list[str],
-    features: pl.DataFrame,
+    window_features: pl.DataFrame,
     predictions: np.ndarray,
     holdout: dict[str, dict[str, Any]],
     model: LightGBMForecaster,
@@ -304,13 +319,11 @@ def run_checks(
     )
     rebuilt = FeatureEngineer(engineer.config).fit_transform(hide_target_after(scrambled, origin))
     window = pl.col(DATE) > origin
-    unchanged = (
-        features.filter(window).select(columns).equals(rebuilt.filter(window).select(columns))
-    )
+    unchanged = window_features.select(columns).equals(rebuilt.filter(window).select(columns))
 
     reloaded = LightGBMForecaster()
     reloaded.load(model_dir)
-    test_rows = features.filter(window)
+    test_rows = window_features
     same_after_reload = bool(
         np.allclose(reloaded.predict(to_model_input(test_rows, columns)), predictions)
     )

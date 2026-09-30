@@ -211,7 +211,12 @@ def _level_matrix(df: pd.DataFrame, keys: list[str], date_col: str, value_col: s
     grouped = df.assign(_all="all").groupby([*(keys or ["_all"]), date_col], observed=True)
     summed = grouped[value_col].sum(min_count=1).rename(value_col).reset_index()
     return summed.pivot_table(
-        index=keys or ["_all"], columns=date_col, values=value_col, aggfunc="sum", dropna=False
+        index=keys or ["_all"],
+        columns=date_col,
+        values=value_col,
+        aggfunc="sum",
+        dropna=False,
+        observed=True,
     ).sort_index(axis=1)
 
 
