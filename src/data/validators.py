@@ -1,8 +1,19 @@
 """
-Data validation schemas using Pandera.
+Data validation with Pandera schemas plus a few plain-Python business rules.
 
-This module provides comprehensive data validation for the forecasting pipeline,
-ensuring data quality and catching issues early in the pipeline.
+Validation runs before feature engineering. The training entry point stops on
+any error, because a model trained on malformed data produces confident
+numbers that mean nothing.
+
+What counts as an error (blocks training):
+- a required column is missing or has the wrong type,
+- a value breaks a schema check (for example negative sales),
+- a required column is more than ``null_threshold`` null,
+- duplicate (series, day) rows, or less history than ``min_history_days``.
+
+What counts as a warning (logged, does not block):
+- nulls in optional columns such as event names or prices before launch,
+- a high share of statistical outliers in sales.
 """
 
 from __future__ import annotations
@@ -11,7 +22,7 @@ import logging
 from typing import Any
 
 import pandas as pd
-import pandera as pa
+import pandera.pandas as pa
 import polars as pl
 from pandera.typing import Series
 from pydantic import BaseModel, Field, field_validator
@@ -20,35 +31,23 @@ logger = logging.getLogger(__name__)
 
 
 class SalesDataSchema(pa.DataFrameModel):
-    """
-    Pandera schema for validating sales data.
-    
-    This schema enforces:
-    - Required columns with correct dtypes
-    - Value range constraints
-    - Null value thresholds
-    """
-    
-    id: Series[str] = pa.Field(nullable=False, description="Unique item-store identifier")
-    item_id: Series[str] = pa.Field(nullable=False, description="Item identifier")
-    store_id: Series[str] = pa.Field(nullable=False, description="Store identifier")
-    d: Series[str] = pa.Field(nullable=False, description="Day identifier (d_1, d_2, ...)")
-    sales: Series[float] = pa.Field(
-        ge=0, 
-        nullable=True,
-        description="Sales quantity (non-negative)"
-    )
-    date: Series[pd.Timestamp] = pa.Field(nullable=False, description="Date of sale")
-    
+    """Schema for long-format sales: one row per series per day."""
+
+    id: Series[str] = pa.Field(nullable=False, description="Item-store series identifier")
+    item_id: Series[str] = pa.Field(nullable=False)
+    store_id: Series[str] = pa.Field(nullable=False)
+    d: Series[str] | None = pa.Field(nullable=False, description="M5 day label (d_1, d_2, ...)")
+    date: Series[pd.Timestamp] = pa.Field(nullable=False)
+    sales: Series[float] = pa.Field(ge=0, nullable=True, description="Units sold, non-negative")
+
     class Config:
-        """Schema configuration."""
         coerce = True
-        strict = False  # Allow additional columns
+        strict = False  # extra columns (calendar, prices) are allowed
 
 
 class CalendarDataSchema(pa.DataFrameModel):
-    """Schema for calendar/events data."""
-    
+    """Schema for the M5 calendar table."""
+
     d: Series[str] = pa.Field(nullable=False)
     date: Series[pd.Timestamp] = pa.Field(nullable=False)
     wm_yr_wk: Series[int] = pa.Field(ge=0, nullable=False)
@@ -56,282 +55,208 @@ class CalendarDataSchema(pa.DataFrameModel):
     wday: Series[int] = pa.Field(ge=1, le=7, nullable=False)
     month: Series[int] = pa.Field(ge=1, le=12, nullable=False)
     year: Series[int] = pa.Field(ge=2000, le=2100, nullable=False)
-    
+
     class Config:
         coerce = True
         strict = False
 
 
 class PriceDataSchema(pa.DataFrameModel):
-    """Schema for pricing data."""
-    
+    """Schema for the M5 weekly price table."""
+
     store_id: Series[str] = pa.Field(nullable=False)
     item_id: Series[str] = pa.Field(nullable=False)
     wm_yr_wk: Series[int] = pa.Field(ge=0, nullable=False)
-    sell_price: Series[float] = pa.Field(
-        gt=0,
-        nullable=True,
-        description="Selling price (positive)"
-    )
-    
+    sell_price: Series[float] = pa.Field(gt=0, nullable=True, description="Positive price")
+
     class Config:
         coerce = True
         strict = False
 
 
 class ValidationResult(BaseModel):
-    """Result of data validation."""
-    
-    is_valid: bool = Field(..., description="Whether validation passed")
-    errors: list[str] = Field(default_factory=list, description="List of validation errors")
-    warnings: list[str] = Field(default_factory=list, description="List of warnings")
-    row_count: int = Field(default=0, description="Number of rows validated")
-    null_percentages: dict[str, float] = Field(
-        default_factory=dict, 
-        description="Null percentage per column"
-    )
-    
+    """Outcome of a validation run."""
+
+    is_valid: bool = Field(..., description="True when there are no errors")
+    errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    row_count: int = Field(default=0)
+    null_percentages: dict[str, float] = Field(default_factory=dict)
+
     @field_validator("errors", "warnings", mode="before")
     @classmethod
-    def ensure_list(cls, v: Any) -> list:
-        """Ensure errors and warnings are lists."""
-        if v is None:
-            return []
-        return list(v)
+    def ensure_list(cls, v: Any) -> list[str]:
+        return [] if v is None else list(v)
+
+
+SCHEMAS: dict[str, type[pa.DataFrameModel]] = {
+    "sales": SalesDataSchema,
+    "calendar": CalendarDataSchema,
+    "prices": PriceDataSchema,
+}
 
 
 class DataValidator:
-    """
-    Comprehensive data validator for the forecasting pipeline.
-    
-    Provides:
-    - Schema validation using Pandera
-    - Statistical validation (distributions, outliers)
-    - Business rule validation
-    - Temporal consistency checks
-    
+    """Validate sales, calendar or price data before training.
+
     Example:
-        >>> validator = DataValidator()
-        >>> result = validator.validate(df)
+        >>> result = DataValidator().validate(df, "sales")
         >>> if not result.is_valid:
         ...     print(result.errors)
     """
-    
+
     def __init__(
         self,
         null_threshold: float = 0.05,
         outlier_std_threshold: float = 4.0,
-        min_history_days: int = 28
+        min_history_days: int = 28,
     ) -> None:
-        """
-        Initialize validator.
-        
-        Args:
-            null_threshold: Maximum allowed null percentage per column
-            outlier_std_threshold: Number of std devs for outlier detection
-            min_history_days: Minimum required history days
-        """
         self.null_threshold = null_threshold
         self.outlier_std_threshold = outlier_std_threshold
         self.min_history_days = min_history_days
-        
-        self._schemas = {
-            "sales": SalesDataSchema,
-            "calendar": CalendarDataSchema,
-            "prices": PriceDataSchema,
-        }
-    
+
     def validate(
         self,
         data: pl.DataFrame | pd.DataFrame,
         schema_name: str = "sales",
-        raise_on_error: bool = False
+        raise_on_error: bool = False,
     ) -> ValidationResult:
-        """
-        Validate data against schema and business rules.
-        
-        Args:
-            data: Data to validate
-            schema_name: Name of schema to use
-            raise_on_error: Whether to raise exception on validation failure
-            
-        Returns:
-            ValidationResult with validation status and details
-        """
-        errors: list[str] = []
+        """Validate ``data`` against a named schema and the business rules."""
+        if schema_name not in SCHEMAS:
+            raise ValueError(f"Unknown schema '{schema_name}'. Choose from {sorted(SCHEMAS)}")
+
+        df = data.to_pandas() if isinstance(data, pl.DataFrame) else data
+        errors = self._validate_schema(df, schema_name)
         warnings: list[str] = []
-        
-        # Convert Polars to Pandas for Pandera
-        if isinstance(data, pl.DataFrame):
-            df = data.to_pandas()
-        else:
-            df = data
-        
-        # Schema validation
-        if schema_name in self._schemas:
-            schema_errors = self._validate_schema(df, schema_name)
-            errors.extend(schema_errors)
-        
-        # Null validation
-        null_percentages = self._calculate_null_percentages(df)
+
+        # Null thresholds only bind on columns the schema requires. Optional
+        # columns (event names, prices before an item launches) are often
+        # mostly null by design, so they are reported but do not block.
+        required = set(SCHEMAS[schema_name].to_schema().columns)
+        null_percentages = self._null_percentages(df)
         for col, pct in null_percentages.items():
-            if pct > self.null_threshold:
-                errors.append(
-                    f"Column '{col}' has {pct:.1%} null values, "
-                    f"exceeding threshold of {self.null_threshold:.1%}"
-                )
-        
-        # Statistical validation
-        stat_warnings = self._validate_statistics(df)
-        warnings.extend(stat_warnings)
-        
-        # Business rules validation
-        business_errors = self._validate_business_rules(df)
-        errors.extend(business_errors)
-        
+            if pct <= self.null_threshold:
+                continue
+            message = f"Column '{col}' is {pct:.1%} null (threshold {self.null_threshold:.1%})"
+            if col in required:
+                errors.append(message)
+            else:
+                warnings.append(message)
+
+        warnings.extend(self._validate_statistics(df))
+        errors.extend(self._validate_business_rules(df))
+
         result = ValidationResult(
-            is_valid=len(errors) == 0,
+            is_valid=not errors,
             errors=errors,
             warnings=warnings,
             row_count=len(df),
-            null_percentages=null_percentages
+            null_percentages=null_percentages,
         )
-        
-        if not result.is_valid:
-            logger.error(f"Validation failed with {len(errors)} errors")
+
+        for warning in warnings:
+            logger.warning("Validation warning: %s", warning)
+        if errors:
             for error in errors:
-                logger.error(f"  - {error}")
-            
+                logger.error("Validation error: %s", error)
             if raise_on_error:
                 raise ValueError(f"Data validation failed: {errors}")
         else:
-            logger.info(f"Validation passed for {len(df):,} rows")
-        
-        if warnings:
-            for warning in warnings:
-                logger.warning(f"  - {warning}")
-        
+            logger.info("Validation passed for %s rows (%s)", f"{len(df):,}", schema_name)
         return result
-    
+
     def _validate_schema(self, df: pd.DataFrame, schema_name: str) -> list[str]:
-        """Validate against Pandera schema."""
-        errors = []
-        schema = self._schemas[schema_name]
-        
         try:
-            schema.validate(df, lazy=True)
+            SCHEMAS[schema_name].validate(df, lazy=True)
         except pa.errors.SchemaErrors as exc:
-            for failure in exc.failure_cases.itertuples():
-                errors.append(
-                    f"Schema error in column '{failure.column}': {failure.check}"
-                )
-        except Exception as e:
-            errors.append(f"Schema validation error: {str(e)}")
-        
-        return errors
-    
-    def _calculate_null_percentages(self, df: pd.DataFrame) -> dict[str, float]:
-        """Calculate null percentage for each column."""
-        return (df.isnull().sum() / len(df)).to_dict()
-    
+            cases = exc.failure_cases[["column", "check", "failure_case"]].astype(str)
+            missing = cases[cases["check"] == "column_in_dataframe"]
+            other = cases[cases["check"] != "column_in_dataframe"]
+            errors = [
+                f"Missing required column '{name}'"
+                for name in missing["failure_case"].drop_duplicates()
+            ]
+            errors += [
+                f"Schema error in column '{row.column}': {row.check}"
+                for row in other.drop_duplicates(["column", "check"]).itertuples(index=False)
+            ]
+            return errors
+        return []
+
+    @staticmethod
+    def _null_percentages(df: pd.DataFrame) -> dict[str, float]:
+        if len(df) == 0:
+            return {}
+        return {str(k): float(v) for k, v in (df.isna().sum() / len(df)).items()}
+
     def _validate_statistics(self, df: pd.DataFrame) -> list[str]:
-        """Validate statistical properties."""
-        warnings = []
-        
-        # Check for outliers in numeric columns
-        numeric_cols = df.select_dtypes(include=["number"]).columns
-        
-        for col in numeric_cols:
-            if col == "sales" and col in df.columns:
-                mean = df[col].mean()
-                std = df[col].std()
-                
-                if std > 0:
-                    outlier_mask = (df[col] - mean).abs() > (self.outlier_std_threshold * std)
-                    outlier_pct = outlier_mask.mean()
-                    
-                    if outlier_pct > 0.01:  # More than 1% outliers
-                        warnings.append(
-                            f"Column '{col}' has {outlier_pct:.1%} potential outliers "
-                            f"({self.outlier_std_threshold} std from mean)"
-                        )
-        
-        return warnings
-    
+        if "sales" not in df.columns:
+            return []
+        sales = pd.to_numeric(df["sales"], errors="coerce")
+        std = sales.std()
+        if not std or pd.isna(std):
+            return []
+        outlier_share = float(
+            ((sales - sales.mean()).abs() > self.outlier_std_threshold * std).mean()
+        )
+        if outlier_share > 0.01:
+            return [
+                f"'sales' has {outlier_share:.1%} values more than "
+                f"{self.outlier_std_threshold} standard deviations from the mean"
+            ]
+        return []
+
     def _validate_business_rules(self, df: pd.DataFrame) -> list[str]:
-        """Validate business-specific rules."""
         errors = []
-        
-        # Check minimum history
-        if "date" in df.columns:
-            date_range = (df["date"].max() - df["date"].min()).days
-            if date_range < self.min_history_days:
+
+        if "date" in df.columns and len(df) > 0:
+            dates = pd.to_datetime(df["date"])
+            span_days = (dates.max() - dates.min()).days
+            if span_days < self.min_history_days:
                 errors.append(
-                    f"Insufficient history: {date_range} days, "
-                    f"minimum required: {self.min_history_days}"
+                    f"Insufficient history: {span_days} days, minimum {self.min_history_days}"
                 )
-        
-        # Check for duplicate entries
-        if {"id", "d"}.issubset(df.columns):
-            duplicates = df.duplicated(subset=["id", "d"]).sum()
-            if duplicates > 0:
-                errors.append(f"Found {duplicates} duplicate id-date combinations")
-        
-        # Check sales non-negativity
+
+        key = ["id", "date"] if {"id", "date"}.issubset(df.columns) else ["id", "d"]
+        if set(key).issubset(df.columns):
+            duplicates = int(df.duplicated(subset=key).sum())
+            if duplicates:
+                errors.append(f"Found {duplicates} duplicate {'/'.join(key)} rows")
+
         if "sales" in df.columns:
-            negative_sales = (df["sales"] < 0).sum()
-            if negative_sales > 0:
-                errors.append(f"Found {negative_sales} negative sales values")
-        
+            negative = int((pd.to_numeric(df["sales"], errors="coerce") < 0).sum())
+            if negative:
+                errors.append(f"Found {negative} negative sales values")
+
         return errors
-    
-    def validate_features(
-        self,
-        features: pd.DataFrame,
-        target: str = "sales"
-    ) -> ValidationResult:
-        """
-        Validate feature matrix before training.
-        
-        Args:
-            features: Feature DataFrame
-            target: Target column name
-            
-        Returns:
-            ValidationResult
-        """
-        errors = []
-        warnings = []
-        
-        # Check for infinite values
-        numeric_cols = features.select_dtypes(include=["number"]).columns
+
+    def validate_features(self, features: pd.DataFrame, target: str = "sales") -> ValidationResult:
+        """Check a feature matrix for infinities, constant columns and near-duplicates."""
+        errors: list[str] = []
+        warnings: list[str] = []
+        numeric_cols = list(features.select_dtypes(include=["number"]).columns)
+
         for col in numeric_cols:
-            inf_count = features[col].isin([float("inf"), float("-inf")]).sum()
-            if inf_count > 0:
+            inf_count = int(features[col].isin([float("inf"), float("-inf")]).sum())
+            if inf_count:
                 errors.append(f"Column '{col}' contains {inf_count} infinite values")
-        
-        # Check feature variance
-        for col in numeric_cols:
             if col != target and features[col].std() == 0:
                 warnings.append(f"Column '{col}' has zero variance")
-        
-        # Check for highly correlated features
+
         if len(numeric_cols) > 1:
-            corr_matrix = features[numeric_cols].corr()
+            corr = features[numeric_cols].corr().to_numpy(dtype=float)
             for i, col1 in enumerate(numeric_cols):
-                for col2 in numeric_cols[i+1:]:
-                    if abs(corr_matrix.loc[col1, col2]) > 0.99:
+                for j in range(i + 1, len(numeric_cols)):
+                    col2, value = numeric_cols[j], float(corr[i, j])
+                    if abs(value) > 0.99:
                         warnings.append(
-                            f"High correlation ({corr_matrix.loc[col1, col2]:.3f}) "
-                            f"between '{col1}' and '{col2}'"
+                            f"High correlation ({value:.3f}) between '{col1}' and '{col2}'"
                         )
-        
-        null_percentages = self._calculate_null_percentages(features)
-        
+
         return ValidationResult(
-            is_valid=len(errors) == 0,
+            is_valid=not errors,
             errors=errors,
             warnings=warnings,
             row_count=len(features),
-            null_percentages=null_percentages
+            null_percentages=self._null_percentages(features),
         )

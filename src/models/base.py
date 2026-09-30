@@ -7,6 +7,7 @@ ensuring consistency and enabling model swapping.
 
 from __future__ import annotations
 
+import copy
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -157,6 +158,18 @@ class BaseForecaster(ABC):
             path: Path to load model from
         """
         pass
+
+    def clone(self) -> BaseForecaster:
+        """Return an unfitted copy with the same configuration.
+
+        The default deep-copies ``self``; subclasses with large fitted state
+        should override it to build a fresh instance instead.
+        """
+        fresh = copy.deepcopy(self)
+        fresh._model = None
+        fresh._is_fitted = False
+        fresh._metadata = None
+        return fresh
 
     @property
     def is_fitted(self) -> bool:

@@ -13,9 +13,9 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 
 class JsonFormatter(logging.Formatter):
@@ -38,7 +38,7 @@ class JsonFormatter(logging.Formatter):
         log_data: dict[str, Any] = {}
 
         if self.include_timestamp:
-            log_data["timestamp"] = datetime.utcnow().isoformat() + "Z"
+            log_data["timestamp"] = datetime.now(UTC).isoformat()
 
         if self.include_level:
             log_data["level"] = record.levelname
@@ -88,7 +88,7 @@ class JsonFormatter(logging.Formatter):
 class ColoredFormatter(logging.Formatter):
     """Colored console formatter for development."""
 
-    COLORS = {
+    COLORS: ClassVar[dict[str, str]] = {
         "DEBUG": "\033[36m",  # Cyan
         "INFO": "\033[32m",  # Green
         "WARNING": "\033[33m",  # Yellow
@@ -150,6 +150,7 @@ def setup_logging(
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(level)
 
+    formatter: logging.Formatter
     if format_type == "json":
         formatter = JsonFormatter(include_timestamp=include_timestamp, extra_fields=extra_fields)
     else:
@@ -182,7 +183,7 @@ def setup_logging(
 
 def get_logger(
     name: str, level: str | int | None = None, extra: dict[str, Any] | None = None
-) -> logging.Logger:
+) -> logging.Logger | logging.LoggerAdapter[logging.Logger]:
     """
     Get a logger with optional configuration.
 
@@ -202,8 +203,7 @@ def get_logger(
         logger.setLevel(level)
 
     if extra:
-        logger = logging.LoggerAdapter(logger, extra)
-
+        return logging.LoggerAdapter(logger, extra)
     return logger
 
 
@@ -216,7 +216,7 @@ class LogContext:
         ...     logger.info("Processing request")
     """
 
-    _context: dict[str, Any] = {}
+    _context: ClassVar[dict[str, Any]] = {}
 
     def __init__(self, **kwargs):
         self.new_context = kwargs

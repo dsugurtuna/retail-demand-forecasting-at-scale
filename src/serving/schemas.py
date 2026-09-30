@@ -4,7 +4,7 @@ Pydantic schemas for API request/response models.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -164,5 +164,5 @@ class ErrorResponse(BaseModel):
 
     error: str
     detail: str | None = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     request_id: str | None = None

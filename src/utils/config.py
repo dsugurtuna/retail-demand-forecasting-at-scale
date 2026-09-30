@@ -174,16 +174,14 @@ def load_config(config_path: str | Path | None = None, environment: str | None =
     if config_path:
         config_path = Path(config_path)
         if config_path.exists():
-            with open(config_path) as f:
-                config_dict = yaml.safe_load(f) or {}
+            config_dict = yaml.safe_load(config_path.read_text()) or {}
 
     # Load environment-specific config
     if environment:
         env_config_path = Path(f"config/{environment}.yaml")
         if env_config_path.exists():
-            with open(env_config_path) as f:
-                env_dict = yaml.safe_load(f) or {}
-                config_dict = _merge_dicts(config_dict, env_dict)
+            env_dict = yaml.safe_load(env_config_path.read_text()) or {}
+            config_dict = _merge_dicts(config_dict, env_dict)
         config_dict["environment"] = environment
 
     # Override with environment variables
@@ -220,15 +218,13 @@ def _apply_env_overrides(config: dict) -> dict:
     }
 
     for env_var, path in env_mappings.items():
-        value = os.environ.get(env_var)
-        if value is not None:
-            # Convert value type
-            if value.lower() in ("true", "false"):
-                value = value.lower() == "true"
-            elif value.isdigit():
-                value = int(value)
-
-            # Set nested value
+        raw = os.environ.get(env_var)
+        if raw is not None:
+            value: Any = raw
+            if raw.lower() in ("true", "false"):
+                value = raw.lower() == "true"
+            elif raw.isdigit():
+                value = int(raw)
             _set_nested(config, path, value)
 
     return config

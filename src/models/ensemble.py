@@ -173,28 +173,26 @@ class EnsembleForecaster(BaseForecaster):
         self,
         X: pd.DataFrame | np.ndarray,
         return_std: bool = False,
-        return_all_predictions: bool = False,
         **kwargs: Any,
-    ) -> np.ndarray | tuple[np.ndarray, ...]:
+    ) -> Any:
         """
         Generate ensemble predictions.
 
         Args:
             X: Features for prediction
-            return_std: Whether to return uncertainty estimates
-            return_all_predictions: Whether to return individual model predictions
-            **kwargs: Additional arguments
+            return_std: Also return the spread between member models
+            **kwargs: ``return_all_predictions=True`` also returns each member's forecasts
 
         Returns:
             Ensemble predictions (and optionally std and individual predictions)
         """
         if len(self._models) == 0:
             raise ValueError("No models in ensemble")
+        return_all_predictions = bool(kwargs.pop("return_all_predictions", False))
 
-        # Get predictions from all models
-        all_preds = {}
-        for name, model in self._models.items():
-            all_preds[name] = model.predict(X, **kwargs)
+        all_preds = {
+            name: np.asarray(model.predict(X), dtype=float) for name, model in self._models.items()
+        }
 
         # Combine predictions
         if self.config.method == "weighted_average":
@@ -207,7 +205,7 @@ class EnsembleForecaster(BaseForecaster):
         # Ensure non-negative
         predictions = np.maximum(predictions, 0)
 
-        result = [predictions]
+        result: list[Any] = [predictions]
 
         if return_std:
             # Estimate uncertainty from model disagreement
@@ -234,11 +232,11 @@ class EnsembleForecaster(BaseForecaster):
         Returns:
             Tuple of (ensemble_prediction, model_contributions)
         """
-        all_preds = {}
-        contributions = {}
+        all_preds: dict[str, np.ndarray] = {}
+        contributions: dict[str, np.ndarray] = {}
 
         for name, model in self._models.items():
-            pred = model.predict(X)
+            pred = np.asarray(model.predict(X), dtype=float)
             all_preds[name] = pred
             contributions[name] = pred * self._weights[name]
 
@@ -304,21 +302,20 @@ class EnsembleForecaster(BaseForecaster):
             model_info[name] = {"type": model.model_type, "weight": self._weights[name]}
 
         # Save ensemble config and weights
-        with open(path / "ensemble_config.json", "w") as f:
-            json.dump(
+        (path / "ensemble_config.json").write_text(
+            json.dumps(
                 {
                     "config": self.config.model_dump(),
                     "models": model_info,
                     "weights": self._weights,
                 },
-                f,
                 indent=2,
             )
+        )
 
         # Save metadata
         if self._metadata:
-            with open(path / "metadata.json", "w") as f:
-                f.write(self._metadata.model_dump_json(indent=2))
+            (path / "metadata.json").write_text(self._metadata.model_dump_json(indent=2))
 
         logger.info(f"Ensemble saved to {path}")
 
@@ -327,8 +324,7 @@ class EnsembleForecaster(BaseForecaster):
         path = Path(path)
 
         # Load config
-        with open(path / "ensemble_config.json") as f:
-            data = json.load(f)
+        data = json.loads((path / "ensemble_config.json").read_text())
 
         self.config = EnsembleConfig.model_validate(data["config"])
         self._weights = data["weights"]
@@ -351,8 +347,7 @@ class EnsembleForecaster(BaseForecaster):
 
         # Load metadata
         if (path / "metadata.json").exists():
-            with open(path / "metadata.json") as f:
-                self._metadata = ModelMetadata.model_validate_json(f.read())
+            self._metadata = ModelMetadata.model_validate_json((path / "metadata.json").read_text())
 
         self._is_fitted = True
         logger.info(f"Ensemble loaded from {path} with {len(self._models)} models")
@@ -361,7 +356,7 @@ class EnsembleForecaster(BaseForecaster):
         """Compute weighted average of predictions."""
         total_weight = sum(self._weights.values())
 
-        result = np.zeros_like(list(predictions.values())[0])
+        result = np.zeros_like(next(iter(predictions.values())), dtype=float)
 
         for name, pred in predictions.items():
             weight = self._weights.get(name, 1.0) / total_weight
@@ -387,7 +382,10 @@ class EnsembleForecaster(BaseForecaster):
         from scipy.optimize import minimize
 
         # Get predictions from all models
-        all_preds = {name: model.predict(X_valid) for name, model in self._models.items()}
+        all_preds = {
+            name: np.asarray(model.predict(X_valid), dtype=float)
+            for name, model in self._models.items()
+        }
         model_names = list(all_preds.keys())
         preds_array = np.array([all_preds[name] for name in model_names])
 
@@ -422,7 +420,7 @@ class EnsembleForecaster(BaseForecaster):
 
         if result.success:
             optimized_weights = result.x / result.x.sum()
-            self._weights = dict(zip(model_names, optimized_weights))
+            self._weights = dict(zip(model_names, map(float, optimized_weights), strict=True))
             self._is_weight_optimized = True
             logger.info(f"Optimized weights: {self._weights}")
         else:
