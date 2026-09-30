@@ -1,216 +1,26 @@
-# =============================================================================
-# Docker Compose for Local Development
-# =============================================================================
-# Provides complete local development environment with:
-# - API service
-# - MLflow tracking server
-# - PostgreSQL for MLflow backend
-# - MinIO for artifact storage (S3 compatible)
-# - Redis for caching
-# =============================================================================
-
-version: "3.9"
+# Local containers for the two things this repository does: train and serve.
+# Not built in CI yet.
+#
+#   docker compose run --rm training            # smoke run, writes ./artefacts/smoke
+#   docker compose up api                       # serves ./artefacts/smoke/model on :8000
+#
+# Earlier versions also started MLflow, PostgreSQL, MinIO, Redis and Jupyter.
+# The code never talked to any of them, so they are not started.
 
 services:
-  # ===========================================================================
-  # Forecasting API Service
-  # ===========================================================================
+  training:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.train
+    volumes:
+      - ./artefacts:/app/artefacts
+    profiles: ["training"]
+
   api:
     build:
       context: .
       dockerfile: infrastructure/docker/Dockerfile.serve
     ports:
       - "8000:8000"
-    environment:
-      - FORECAST_ENVIRONMENT=development
-      - FORECAST_SERVING_HOST=0.0.0.0
-      - FORECAST_SERVING_PORT=8000
-      - FORECAST_MODEL_PATH=/app/models/model.pkl
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
     volumes:
-      - ./models:/app/models:ro
-      - ./src:/app/src:ro
-    depends_on:
-      - mlflow
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    networks:
-      - forecasting-network
-
-  # ===========================================================================
-  # Training Service
-  # ===========================================================================
-  training:
-    build:
-      context: .
-      dockerfile: infrastructure/docker/Dockerfile.train
-    environment:
-      - FORECAST_ENVIRONMENT=development
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
-      - AWS_ACCESS_KEY_ID=minioadmin
-      - AWS_SECRET_ACCESS_KEY=minioadmin
-      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
-    volumes:
-      - ./data:/app/data
-      - ./models:/app/models
-      - ./src:/app/src
-      - ./config:/app/config
-    depends_on:
-      - mlflow
-      - minio
-    networks:
-      - forecasting-network
-    profiles:
-      - training
-
-  # ===========================================================================
-  # MLflow Tracking Server
-  # ===========================================================================
-  mlflow:
-    image: ghcr.io/mlflow/mlflow:v2.9.2
-    ports:
-      - "5000:5000"
-    environment:
-      - MLFLOW_BACKEND_STORE_URI=postgresql://mlflow:mlflow@postgres:5432/mlflow
-      - MLFLOW_DEFAULT_ARTIFACT_ROOT=s3://mlflow-artifacts/
-      - AWS_ACCESS_KEY_ID=minioadmin
-      - AWS_SECRET_ACCESS_KEY=minioadmin
-      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
-    command: >
-      mlflow server
-      --host 0.0.0.0
-      --port 5000
-      --backend-store-uri postgresql://mlflow:mlflow@postgres:5432/mlflow
-      --default-artifact-root s3://mlflow-artifacts/
-    depends_on:
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_started
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    networks:
-      - forecasting-network
-
-  # ===========================================================================
-  # PostgreSQL Database (MLflow Backend)
-  # ===========================================================================
-  postgres:
-    image: postgres:15-alpine
-    environment:
-      - POSTGRES_USER=mlflow
-      - POSTGRES_PASSWORD=mlflow
-      - POSTGRES_DB=mlflow
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mlflow"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - forecasting-network
-
-  # ===========================================================================
-  # MinIO (S3-Compatible Object Storage)
-  # ===========================================================================
-  minio:
-    image: minio/minio:latest
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    environment:
-      - MINIO_ROOT_USER=minioadmin
-      - MINIO_ROOT_PASSWORD=minioadmin
-    volumes:
-      - minio_data:/data
-    command: server /data --console-address ":9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    networks:
-      - forecasting-network
-
-  # MinIO setup (create bucket)
-  minio-setup:
-    image: minio/mc:latest
-    depends_on:
-      - minio
-    entrypoint: >
-      /bin/sh -c "
-      /usr/bin/mc config host add myminio http://minio:9000 minioadmin minioadmin;
-      /usr/bin/mc mb --ignore-existing myminio/mlflow-artifacts;
-      /usr/bin/mc mb --ignore-existing myminio/forecast-data;
-      exit 0;
-      "
-    networks:
-      - forecasting-network
-
-  # ===========================================================================
-  # Redis (Feature Caching)
-  # ===========================================================================
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - forecasting-network
-
-  # ===========================================================================
-  # Jupyter Notebook (Development)
-  # ===========================================================================
-  jupyter:
-    build:
-      context: .
-      dockerfile: infrastructure/docker/Dockerfile.train
-      target: development
-    ports:
-      - "8888:8888"
-    environment:
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
-    volumes:
-      - ./:/app
-    command: >
-      jupyter lab
-      --ip=0.0.0.0
-      --port=8888
-      --no-browser
-      --allow-root
-      --NotebookApp.token=''
-    depends_on:
-      - mlflow
-    networks:
-      - forecasting-network
-    profiles:
-      - dev
-
-# =============================================================================
-# Volumes
-# =============================================================================
-volumes:
-  postgres_data:
-  minio_data:
-  redis_data:
-
-# =============================================================================
-# Networks
-# =============================================================================
-networks:
-  forecasting-network:
-    driver: bridge
+      - ./artefacts/smoke/model:/app/models/model:ro

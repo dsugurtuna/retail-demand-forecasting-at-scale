@@ -1,343 +1,185 @@
 """
-Data loading module with support for multiple data sources.
+Load M5-format retail data from local CSV or Parquet files.
 
-This module provides enterprise-grade data loading capabilities with:
-- Multi-source ingestion (local, S3, databases)
-- Lazy loading for large datasets
-- Automatic schema validation
-- Caching layer for performance
+The M5 competition data (https://www.kaggle.com/c/m5-forecasting-accuracy) comes
+as three files:
+
+- ``sales_train_evaluation.csv``: one row per item-store series, one column per
+  day (``d_1`` ... ``d_1941``).
+- ``calendar.csv``: one row per day, with events and SNAP flags.
+- ``sell_prices.csv``: weekly prices per item and store.
+
+This module reads those files (or Parquet equivalents), turns sales into long
+format and joins everything into one frame with one row per series per day.
+It reads local files only. It never falls back to synthetic data: if a file is
+missing you get an error, not a model silently trained on made-up numbers.
 """
 
 from __future__ import annotations
 
 import logging
-from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
 
-import pandas as pd
 import polars as pl
-from pydantic import BaseModel, Field
 
-if TYPE_CHECKING:
-    from src.utils.config import Config
+from src.utils.config import Config
 
 logger = logging.getLogger(__name__)
 
-
-class DataSourceConfig(BaseModel):
-    """Configuration for a data source."""
-    
-    source_type: str = Field(..., description="Type of data source: 'local', 's3', 'database'")
-    path: str = Field(..., description="Path or connection string for the data source")
-    format: str = Field(default="parquet", description="Data format: 'parquet', 'csv', 'delta'")
-    partition_cols: list[str] = Field(default_factory=list, description="Partition columns")
-    lazy: bool = Field(default=True, description="Whether to use lazy loading")
-    
-
-class DataSource(Protocol):
-    """Protocol for data sources."""
-    
-    def read(self, **kwargs: Any) -> pl.LazyFrame | pl.DataFrame:
-        """Read data from the source."""
-        ...
-    
-    def write(self, data: pl.DataFrame | pd.DataFrame, **kwargs: Any) -> None:
-        """Write data to the source."""
-        ...
+SERIES_ID_COLUMNS = ["id", "item_id", "dept_id", "cat_id", "store_id", "state_id"]
 
 
-class LocalDataSource:
-    """Local filesystem data source."""
-    
-    def __init__(self, config: DataSourceConfig) -> None:
-        self.config = config
-        self.path = Path(config.path)
-    
-    def read(self, lazy: bool | None = None, **kwargs: Any) -> pl.LazyFrame | pl.DataFrame:
-        """
-        Read data from local filesystem.
-        
-        Args:
-            lazy: Override config lazy setting
-            **kwargs: Additional arguments passed to read function
-            
-        Returns:
-            Polars DataFrame or LazyFrame
-        """
-        use_lazy = lazy if lazy is not None else self.config.lazy
-        
-        if self.config.format == "parquet":
-            if use_lazy:
-                return pl.scan_parquet(self.path, **kwargs)
-            return pl.read_parquet(self.path, **kwargs)
-        elif self.config.format == "csv":
-            if use_lazy:
-                return pl.scan_csv(self.path, **kwargs)
-            return pl.read_csv(self.path, **kwargs)
-        else:
-            raise ValueError(f"Unsupported format: {self.config.format}")
-    
-    def write(
-        self, 
-        data: pl.DataFrame | pd.DataFrame, 
-        partition_by: list[str] | None = None,
-        **kwargs: Any
-    ) -> None:
-        """Write data to local filesystem."""
-        if isinstance(data, pd.DataFrame):
-            data = pl.from_pandas(data)
-        
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        
-        if self.config.format == "parquet":
-            if partition_by:
-                data.write_parquet(
-                    self.path,
-                    use_pyarrow=True,
-                    pyarrow_options={"partition_cols": partition_by},
-                    **kwargs
-                )
-            else:
-                data.write_parquet(self.path, **kwargs)
-        elif self.config.format == "csv":
-            data.write_csv(self.path, **kwargs)
-
-
-class S3DataSource:
-    """AWS S3 data source."""
-    
-    def __init__(self, config: DataSourceConfig) -> None:
-        self.config = config
-        self._validate_s3_path()
-    
-    def _validate_s3_path(self) -> None:
-        """Validate S3 path format."""
-        if not self.config.path.startswith("s3://"):
-            raise ValueError(f"Invalid S3 path: {self.config.path}")
-    
-    def read(self, lazy: bool | None = None, **kwargs: Any) -> pl.LazyFrame | pl.DataFrame:
-        """Read data from S3."""
-        use_lazy = lazy if lazy is not None else self.config.lazy
-        
-        storage_options = kwargs.pop("storage_options", {})
-        
-        if self.config.format == "parquet":
-            if use_lazy:
-                return pl.scan_parquet(
-                    self.config.path, 
-                    storage_options=storage_options,
-                    **kwargs
-                )
-            return pl.read_parquet(
-                self.config.path,
-                storage_options=storage_options,
-                **kwargs
-            )
-        else:
-            raise ValueError(f"Unsupported format for S3: {self.config.format}")
-    
-    def write(
-        self, 
-        data: pl.DataFrame | pd.DataFrame,
-        **kwargs: Any
-    ) -> None:
-        """Write data to S3."""
-        if isinstance(data, pd.DataFrame):
-            data = pl.from_pandas(data)
-        
-        storage_options = kwargs.pop("storage_options", {})
-        data.write_parquet(
-            self.config.path,
-            storage_options=storage_options,
-            **kwargs
+def _scan(path: Path) -> pl.LazyFrame:
+    """Lazily scan a CSV or Parquet file, chosen by suffix."""
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found. Download the M5 files from Kaggle into this directory, "
+            "or run `python -m src.train --smoke` to use synthetic data instead."
         )
+    if path.suffix == ".parquet":
+        return pl.scan_parquet(path)
+    if path.suffix == ".csv":
+        return pl.scan_csv(path)
+    raise ValueError(f"Unsupported file type for {path}: expected .csv or .parquet")
+
+
+def _ensure_date(calendar: pl.DataFrame) -> pl.DataFrame:
+    """Make sure the calendar ``date`` column is a Date, not a string."""
+    if calendar.schema["date"] == pl.String:
+        return calendar.with_columns(pl.col("date").str.to_date("%Y-%m-%d"))
+    if calendar.schema["date"] != pl.Date:
+        return calendar.with_columns(pl.col("date").cast(pl.Date))
+    return calendar
+
+
+def sales_to_long(sales: pl.DataFrame) -> pl.DataFrame:
+    """Convert wide M5 sales (one column per day) to long format.
+
+    Long-format input (already has a ``d`` column) is returned unchanged apart
+    from casting ``sales`` to float, so the target can later hold nulls.
+    """
+    day_cols = [c for c in sales.columns if c.startswith("d_")]
+    if day_cols:
+        id_cols = [c for c in sales.columns if not c.startswith("d_")]
+        sales = sales.unpivot(index=id_cols, on=day_cols, variable_name="d", value_name="sales")
+    return sales.with_columns(pl.col("sales").cast(pl.Float64))
+
+
+def sales_to_wide(sales_long: pl.DataFrame) -> pl.DataFrame:
+    """Convert long sales back to the wide M5 layout (inverse of ``sales_to_long``)."""
+    day_order = (
+        sales_long.select("d")
+        .unique()
+        .with_columns(pl.col("d").str.slice(2).cast(pl.Int64).alias("_n"))
+        .sort("_n")["d"]
+        .to_list()
+    )
+    id_cols = [c for c in SERIES_ID_COLUMNS if c in sales_long.columns]
+    wide = sales_long.pivot(on="d", index=id_cols, values="sales")
+    return wide.select([*id_cols, *day_order])
+
+
+def merge_m5_frames(
+    sales: pl.DataFrame, calendar: pl.DataFrame, prices: pl.DataFrame
+) -> pl.DataFrame:
+    """Join sales, calendar and prices into one long frame, sorted by series and date.
+
+    Adds a ``snap`` column holding the SNAP flag for each row's own state and
+    drops the per-state ``snap_XX`` columns, which would otherwise hand the model
+    two irrelevant flags on every row.
+    """
+    sales = sales_to_long(sales)
+    calendar = _ensure_date(calendar)
+
+    merged = sales.join(calendar, on="d", how="left").join(
+        prices, on=["store_id", "item_id", "wm_yr_wk"], how="left"
+    )
+
+    snap_cols = [c for c in merged.columns if c.startswith("snap_")]
+    if snap_cols and "state_id" in merged.columns:
+        snap_expr: pl.Expr = pl.lit(0, dtype=pl.Int8)
+        for col in snap_cols:
+            state = col.removeprefix("snap_")
+            snap_expr = (
+                pl.when(pl.col("state_id") == state)
+                .then(pl.col(col).cast(pl.Int8))
+                .otherwise(snap_expr)
+            )
+        merged = merged.with_columns(snap_expr.alias("snap")).drop(snap_cols)
+
+    return merged.sort(["id", "date"])
+
+
+def write_m5_files(
+    sales_long: pl.DataFrame,
+    calendar: pl.DataFrame,
+    prices: pl.DataFrame,
+    out_dir: str | Path,
+    config: Config | None = None,
+) -> dict[str, Path]:
+    """Write frames to disk in the M5 CSV layout, using the file names in ``config``."""
+    data_config = (config or Config()).data
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "sales": out / data_config.sales_file,
+        "calendar": out / data_config.calendar_file,
+        "prices": out / data_config.prices_file,
+    }
+    sales_to_wide(sales_long).with_columns(pl.col(pl.Float64).cast(pl.Int64)).write_csv(
+        paths["sales"]
+    )
+    calendar.write_csv(paths["calendar"])
+    prices.write_csv(paths["prices"])
+    return paths
 
 
 class DataLoader:
-    """
-    Enterprise data loader with multi-source support.
-    
-    Features:
-    - Lazy loading with Polars for memory efficiency
-    - Multi-source ingestion (local, S3, databases)
-    - Automatic data validation
-    - Caching layer
-    - Hierarchical data merge support
-    
+    """Load and merge M5-format files from a local directory.
+
     Example:
-        >>> config = Config.from_yaml("config/config.yaml")
-        >>> loader = DataLoader(config)
-        >>> data = loader.load_all()
-        >>> print(data.shape)
+        >>> loader = DataLoader(data_dir="data/raw")
+        >>> df = loader.load_all(stores=["CA_1"])
     """
-    
-    def __init__(self, config: Config) -> None:
-        """
-        Initialize DataLoader.
-        
-        Args:
-            config: Application configuration
-        """
-        self.config = config
-        self._sources: dict[str, DataSource] = {}
-        self._cache: dict[str, pl.DataFrame] = {}
-        self._setup_sources()
-    
-    def _setup_sources(self) -> None:
-        """Initialize data sources from configuration."""
-        data_config = self.config.data
-        
-        for name, source_config in data_config.sources.items():
-            if isinstance(source_config, str):
-                # Simple path string - determine source type
-                source_config = DataSourceConfig(
-                    source_type="s3" if source_config.startswith("s3://") else "local",
-                    path=source_config
-                )
-            
-            if source_config.source_type == "local":
-                self._sources[name] = LocalDataSource(source_config)
-            elif source_config.source_type == "s3":
-                self._sources[name] = S3DataSource(source_config)
-            else:
-                raise ValueError(f"Unknown source type: {source_config.source_type}")
-    
-    def load_sales(self, lazy: bool = True) -> pl.LazyFrame | pl.DataFrame:
-        """
-        Load sales data.
-        
-        Args:
-            lazy: Whether to return a LazyFrame for memory efficiency
-            
-        Returns:
-            Sales data as LazyFrame or DataFrame
-        """
-        logger.info("Loading sales data...")
-        
-        if "sales" not in self._sources:
-            logger.warning("Sales source not configured, generating synthetic data")
-            from src.data.synthetic import SyntheticDataGenerator
-            generator = SyntheticDataGenerator(self.config)
-            return generator.generate_sales()
-        
-        return self._sources["sales"].read(lazy=lazy)
-    
-    def load_calendar(self, lazy: bool = True) -> pl.LazyFrame | pl.DataFrame:
-        """Load calendar/events data."""
-        logger.info("Loading calendar data...")
-        
-        if "calendar" not in self._sources:
-            from src.data.synthetic import SyntheticDataGenerator
-            generator = SyntheticDataGenerator(self.config)
-            return generator.generate_calendar()
-        
-        return self._sources["calendar"].read(lazy=lazy)
-    
-    def load_prices(self, lazy: bool = True) -> pl.LazyFrame | pl.DataFrame:
-        """Load pricing data."""
-        logger.info("Loading price data...")
-        
-        if "prices" not in self._sources:
-            from src.data.synthetic import SyntheticDataGenerator
-            generator = SyntheticDataGenerator(self.config)
-            return generator.generate_prices()
-        
-        return self._sources["prices"].read(lazy=lazy)
-    
-    def load_all(
-        self,
-        lazy: bool = False,
-        validate: bool = True
-    ) -> pl.DataFrame:
-        """
-        Load and merge all data sources.
-        
-        Args:
-            lazy: Whether to use lazy evaluation
-            validate: Whether to validate data after loading
-            
-        Returns:
-            Merged DataFrame with all data
-        """
-        logger.info("Loading and merging all data sources...")
-        
-        # Load all sources (as lazy frames for efficiency)
-        sales = self.load_sales(lazy=True)
-        calendar = self.load_calendar(lazy=True)
-        prices = self.load_prices(lazy=True)
-        
-        # Check if sales is in wide format (needs melting)
-        sales_collected = sales.collect() if isinstance(sales, pl.LazyFrame) else sales
-        
-        if any(col.startswith("d_") for col in sales_collected.columns):
-            logger.info("Melting wide-format sales data...")
-            sales_collected = self._melt_sales(sales_collected)
-        
-        # Convert back to lazy for efficient joins
-        sales_lazy = sales_collected.lazy()
-        calendar_lazy = calendar if isinstance(calendar, pl.LazyFrame) else calendar.lazy()
-        prices_lazy = prices if isinstance(prices, pl.LazyFrame) else prices.lazy()
-        
-        # Merge datasets
-        logger.info("Joining with calendar data...")
-        merged = sales_lazy.join(
-            calendar_lazy,
-            on="d",
-            how="left"
+
+    def __init__(self, config: Config | None = None, data_dir: str | Path | None = None) -> None:
+        data_config = (config or Config()).data
+        root = Path(data_dir) if data_dir is not None else Path(data_config.raw_path)
+        self.paths: dict[str, Path] = {
+            "sales": root / data_config.sales_file,
+            "calendar": root / data_config.calendar_file,
+            "prices": root / data_config.prices_file,
+        }
+
+    def load_sales(self, stores: Sequence[str] | None = None) -> pl.DataFrame:
+        """Load sales in long format, optionally restricted to some stores."""
+        scan = _scan(self.paths["sales"])
+        if stores:
+            scan = scan.filter(pl.col("store_id").is_in(list(stores)))
+        return sales_to_long(scan.collect())
+
+    def load_calendar(self) -> pl.DataFrame:
+        """Load the calendar with ``date`` parsed as a Date."""
+        return _ensure_date(_scan(self.paths["calendar"]).collect())
+
+    def load_prices(self, stores: Sequence[str] | None = None) -> pl.DataFrame:
+        """Load weekly prices, optionally restricted to some stores."""
+        scan = _scan(self.paths["prices"])
+        if stores:
+            scan = scan.filter(pl.col("store_id").is_in(list(stores)))
+        return scan.collect()
+
+    def load_all(self, stores: Sequence[str] | None = None) -> pl.DataFrame:
+        """Load all three files and merge them into one long frame."""
+        sales = self.load_sales(stores)
+        if sales.is_empty():
+            raise ValueError(f"No sales rows found for stores={list(stores or [])}")
+        merged = merge_m5_frames(sales, self.load_calendar(), self.load_prices(stores))
+        logger.info(
+            "Loaded %s rows, %s series, %s columns",
+            f"{len(merged):,}",
+            f"{merged['id'].n_unique():,}",
+            len(merged.columns),
         )
-        
-        logger.info("Joining with price data...")
-        merged = merged.join(
-            prices_lazy,
-            on=["store_id", "item_id", "wm_yr_wk"],
-            how="left"
-        )
-        
-        # Collect result
-        result = merged.collect()
-        
-        # Validate if requested
-        if validate:
-            from src.data.validators import DataValidator
-            validator = DataValidator()
-            validator.validate(result)
-        
-        logger.info(f"Loaded {len(result):,} rows with {len(result.columns)} columns")
-        return result
-    
-    def _melt_sales(self, sales: pl.DataFrame) -> pl.DataFrame:
-        """Convert wide-format sales to long format."""
-        # Identify day columns
-        day_cols = [col for col in sales.columns if col.startswith("d_")]
-        id_cols = [col for col in sales.columns if not col.startswith("d_")]
-        
-        # Melt using Polars
-        melted = sales.melt(
-            id_vars=id_cols,
-            value_vars=day_cols,
-            variable_name="d",
-            value_name="sales"
-        )
-        
-        return melted
-    
-    def save(
-        self,
-        data: pl.DataFrame | pd.DataFrame,
-        name: str,
-        partition_by: list[str] | None = None
-    ) -> None:
-        """
-        Save data to a configured destination.
-        
-        Args:
-            data: Data to save
-            name: Name of the destination (must be configured)
-            partition_by: Columns to partition by
-        """
-        if name not in self._sources:
-            raise ValueError(f"Unknown data source: {name}")
-        
-        self._sources[name].write(data, partition_by=partition_by)
-        logger.info(f"Saved data to {name}")
+        return merged

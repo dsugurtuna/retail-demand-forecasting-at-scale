@@ -1,115 +1,133 @@
-# =============================================================================
-# Model Training Workflow
-# =============================================================================
-# Automated model training and registration pipeline
-# Triggers on schedule or manual dispatch
-# =============================================================================
+# Model training.
+#
+# Scheduled (weekly): a smoke run. It trains on a small synthetic dataset
+# generated in the repo, backtests two folds and fails if any end-to-end
+# check fails (see `python -m src.train --help`). It takes about a minute and
+# catches breakage from new releases of LightGBM, Polars, pandas or Pandera.
+#
+# Why not full training on a schedule? The old job "downloaded training
+# data" with a step that only echoed text, ran for up to 80 minutes, tried to
+# install PyTorch and a dozen libraries the code never imports, and pointed at
+# a training module that did not exist. It failed every week without testing
+# anything. The M5 data needs a Kaggle account, and all 30,490 series need
+# more memory than a hosted runner has, so full training is an explicit,
+# manual choice.
+#
+# Manual runs (Actions > Model Training > Run workflow) take these inputs:
+#   mode            smoke | synthetic | m5
+#   n_items         synthetic mode: number of items (default 210)
+#   n_stores        synthetic mode: stores, 1-10 (default 10)
+#   n_days          synthetic mode: days of history (default 1941, as M5).
+#                   The defaults (2,100 series) peaked at 10.2 GB of RAM in a
+#                   local run with one backtest fold.
+#   m5_stores       m5 mode: comma-separated store IDs (default CA_1);
+#                   empty means all ten stores, which will not fit in a
+#                   standard runner's memory
+#   n_estimators    maximum boosting rounds (default 2000, early stopping)
+#   backtest_folds  rolling-origin folds after the holdout (default 3)
+# m5 mode needs repository secrets KAGGLE_USERNAME and KAGGLE_KEY for an
+# account that has accepted the M5 competition rules. m5 mode has not been
+# run in CI yet.
 
 name: Model Training
 
 on:
   schedule:
-    # Run weekly on Sunday at 2:00 AM UTC
-    - cron: "0 2 * * 0"
+    - cron: "0 2 * * 0" # Sundays 02:00 UTC
   workflow_dispatch:
     inputs:
-      experiment_name:
-        description: "MLflow experiment name"
-        required: false
-        default: "retail_forecasting"
-      n_folds:
-        description: "Number of CV folds"
-        required: false
-        default: "5"
+      mode:
+        description: "smoke (synthetic, with checks), synthetic (larger), or m5 (Kaggle data)"
+        type: choice
+        options: [smoke, synthetic, m5]
+        default: smoke
+      n_items:
+        description: "synthetic: number of items"
+        default: "210"
+      n_stores:
+        description: "synthetic: number of stores (1-10)"
+        default: "10"
+      n_days:
+        description: "synthetic: days of history"
+        default: "1941"
+      m5_stores:
+        description: "m5: comma-separated store IDs (empty = all 10)"
+        default: "CA_1"
+      n_estimators:
+        description: "maximum boosting rounds"
+        default: "2000"
+      backtest_folds:
+        description: "rolling-origin backtest folds"
+        default: "3"
 
-env:
-  PYTHON_VERSION: "3.11"
+permissions:
+  contents: read
 
 jobs:
   train:
-    name: Train Model
+    name: Train (${{ inputs.mode || 'smoke' }})
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ (inputs.mode || 'smoke') == 'smoke' && 20 || 300 }}
+    env:
+      MODE: ${{ inputs.mode || 'smoke' }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: "pip"
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: python -m pip install -e .
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+      - name: Smoke run
+        if: env.MODE == 'smoke'
+        run: python -m src.train --smoke --output-dir artefacts/smoke
 
-      - name: Download training data
-        run: |
-          # Download data from S3 or other source
-          echo "Downloading training data..."
-          mkdir -p data/raw
-
-      - name: Train model
+      - name: Synthetic run
+        if: env.MODE == 'synthetic'
         env:
-          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: |
-          python -m src.train \
-            --experiment-name "${{ github.event.inputs.experiment_name || 'retail_forecasting' }}" \
-            --n-folds "${{ github.event.inputs.n_folds || '5' }}"
+          N_ITEMS: ${{ inputs.n_items }}
+          N_STORES: ${{ inputs.n_stores }}
+          N_DAYS: ${{ inputs.n_days }}
+          N_ESTIMATORS: ${{ inputs.n_estimators }}
+          FOLDS: ${{ inputs.backtest_folds }}
+        run: >
+          python -m src.train --synthetic
+          --n-items "$N_ITEMS" --n-stores "$N_STORES" --n-days "$N_DAYS"
+          --n-estimators "$N_ESTIMATORS" --backtest-folds "$FOLDS"
+          --output-dir artefacts/synthetic
 
-      - name: Upload model artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: model-artifacts
-          path: models/
-
-      - name: Register model
+      - name: Download M5 data from Kaggle
+        if: env.MODE == 'm5'
         env:
-          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
-          echo "Registering model in MLflow Model Registry..."
-          # python -m src.register_model
+          if [ -z "$KAGGLE_USERNAME" ] || [ -z "$KAGGLE_KEY" ]; then
+            echo "::error::Set the KAGGLE_USERNAME and KAGGLE_KEY repository secrets for m5 mode."
+            exit 1
+          fi
+          python -m pip install kaggle
+          kaggle competitions download -c m5-forecasting-accuracy -p data/raw
+          unzip -o -q data/raw/m5-forecasting-accuracy.zip -d data/raw
 
-  evaluate:
-    name: Evaluate Model
-    runs-on: ubuntu-latest
-    needs: train
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: M5 run
+        if: env.MODE == 'm5'
+        env:
+          STORES: ${{ inputs.m5_stores }}
+          N_ESTIMATORS: ${{ inputs.n_estimators }}
+          FOLDS: ${{ inputs.backtest_folds }}
+        run: >
+          python -m src.train --data-dir data/raw --stores "$STORES"
+          --n-estimators "$N_ESTIMATORS" --backtest-folds "$FOLDS"
+          --output-dir artefacts/m5
 
-      - name: Download model artifacts
-        uses: actions/download-artifact@v4
+      - name: Upload artefacts
+        if: always()
+        uses: actions/upload-artifact@v6
         with:
-          name: model-artifacts
-          path: models/
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: "pip"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-
-      - name: Run backtesting
-        run: |
-          echo "Running backtesting evaluation..."
-          # python -m src.evaluate --model-path models/model.pkl
-
-      - name: Generate report
-        run: |
-          echo "Generating evaluation report..."
-          # python -m src.report
-
-      - name: Upload evaluation report
-        uses: actions/upload-artifact@v4
-        with:
-          name: evaluation-report
-          path: reports/
+          name: training-${{ env.MODE }}-${{ github.run_id }}
+          path: artefacts/
+          if-no-files-found: ignore
+          retention-days: 30

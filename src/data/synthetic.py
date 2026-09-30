@@ -1,357 +1,292 @@
 """
-Synthetic data generation for testing and development.
+Synthetic M5-style retail data for tests, CI smoke runs and demos.
 
-Generates realistic M5-like data for testing the forecasting pipeline
-without requiring access to the actual dataset.
+The generator produces the same three tables as the M5 competition (sales,
+calendar, prices) with the same column names, so every code path that handles
+real M5 files can be exercised without downloading anything.
+
+Demand is simulated, not sampled from any real retailer. Each series has a
+base rate drawn from a log-normal distribution (a mix of slow and fast movers),
+multiplied by day-of-week and yearly seasonality, a small trend, event and
+SNAP uplifts, and a price response (promotions raise demand). Daily sales are
+then drawn from a Poisson distribution with gamma noise, which gives integer
+counts and realistic runs of zeros for slow movers.
+
+Because the data-generating process is known, the features the model should
+find useful (lags, calendar, price, events) really do carry signal. That makes
+the smoke run a meaningful check: a model that cannot beat a naive baseline on
+this data is broken.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import polars as pl
 from pydantic import BaseModel, Field
-
-if TYPE_CHECKING:
-    from src.utils.config import Config
 
 logger = logging.getLogger(__name__)
 
 
 class SyntheticDataConfig(BaseModel):
     """Configuration for synthetic data generation."""
-    
+
     n_items: int = Field(default=100, ge=1, le=10000)
-    n_stores: int = Field(default=4, ge=1, le=100)
-    n_days: int = Field(default=1941, ge=28)  # M5 has 1941 days
+    n_stores: int = Field(default=4, ge=1, le=10, description="Up to the 10 M5 store IDs")
+    n_days: int = Field(default=1941, ge=56, description="M5 has 1,941 days")
     start_date: str = Field(default="2011-01-29")
-    
-    # Demand parameters
-    base_demand_mean: float = Field(default=5.0, ge=0)
-    base_demand_std: float = Field(default=2.0, ge=0)
-    
-    # Seasonality
-    weekly_seasonality: bool = Field(default=True)
-    monthly_seasonality: bool = Field(default=True)
-    yearly_seasonality: bool = Field(default=True)
-    
-    # Events
+
+    # Demand
+    base_demand_mean: float = Field(default=3.0, gt=0, description="Mean daily rate per series")
+    base_demand_dispersion: float = Field(
+        default=0.9, ge=0, description="Log-normal sigma of per-series base rates"
+    )
+    noise_shape: float = Field(default=4.0, gt=0, description="Gamma shape of daily noise")
+    trend_per_year: float = Field(default=0.03, description="Relative demand growth per year")
+
+    # Events and SNAP
     event_probability: float = Field(default=0.05, ge=0, le=1)
-    event_uplift: float = Field(default=1.5, ge=1)
-    
+    event_uplift: float = Field(default=1.3, ge=1)
+    snap_uplift_foods: float = Field(default=1.15, ge=1)
+
     # Price
     price_mean: float = Field(default=5.0, gt=0)
     price_std: float = Field(default=2.0, ge=0)
     promotion_probability: float = Field(default=0.1, ge=0, le=1)
-    promotion_discount: float = Field(default=0.2, ge=0, le=1)
-    
+    promotion_discount: float = Field(default=0.2, ge=0, lt=1)
+    price_elasticity: float = Field(default=1.5, ge=0)
+
     random_seed: int = Field(default=42)
 
 
 class SyntheticDataGenerator:
-    """
-    Generate synthetic retail data for testing and development.
-    
-    Creates realistic M5-like data with:
-    - Multiple hierarchies (item, category, store, state)
-    - Temporal patterns (weekly, monthly, yearly seasonality)
-    - Events and holidays
-    - Price variations and promotions
-    - SNAP (food assistance) effects
-    
+    """Generate synthetic M5-style sales, calendar and price tables.
+
     Example:
-        >>> generator = SyntheticDataGenerator()
-        >>> sales = generator.generate_sales()
-        >>> calendar = generator.generate_calendar()
-        >>> prices = generator.generate_prices()
+        >>> generator = SyntheticDataGenerator(SyntheticDataConfig(n_items=21, n_stores=2))
+        >>> sales, calendar, prices = generator.generate_all()
     """
-    
-    STORES = {
+
+    STORES: dict[str, list[str]] = {  # noqa: RUF012 - read-only lookup table
         "CA": ["CA_1", "CA_2", "CA_3", "CA_4"],
         "TX": ["TX_1", "TX_2", "TX_3"],
         "WI": ["WI_1", "WI_2", "WI_3"],
     }
-    
-    CATEGORIES = {
-        "FOODS": ["FOODS_1", "FOODS_2", "FOODS_3"],
-        "HOBBIES": ["HOBBIES_1", "HOBBIES_2"],
-        "HOUSEHOLD": ["HOUSEHOLD_1", "HOUSEHOLD_2"],
-    }
-    
-    EVENTS = [
+
+    DEPARTMENTS: list[tuple[str, str]] = [  # noqa: RUF012 - read-only lookup table
+        ("FOODS", "FOODS_1"),
+        ("FOODS", "FOODS_2"),
+        ("FOODS", "FOODS_3"),
+        ("HOBBIES", "HOBBIES_1"),
+        ("HOBBIES", "HOBBIES_2"),
+        ("HOUSEHOLD", "HOUSEHOLD_1"),
+        ("HOUSEHOLD", "HOUSEHOLD_2"),
+    ]
+
+    EVENTS: list[tuple[str, str]] = [  # noqa: RUF012 - read-only lookup table
         ("SuperBowl", "Sporting"),
         ("ValentinesDay", "Cultural"),
         ("PresidentsDay", "National"),
-        ("LentStart", "Religious"),
-        ("LentWeek2", "Religious"),
         ("StPatricksDay", "Cultural"),
-        ("Purim End", "Religious"),
-        ("OrthodoxEaster", "Religious"),
-        ("Pesach End", "Religious"),
-        ("Cinco De Mayo", "Cultural"),
-        ("Mother's day", "Cultural"),
+        ("Easter", "Religious"),
         ("MemorialDay", "National"),
-        ("NBAFinalsStart", "Sporting"),
-        ("NBAFinalsEnd", "Sporting"),
-        ("Father's day", "Cultural"),
         ("IndependenceDay", "National"),
-        ("Ramadan starts", "Religious"),
-        ("Eid al-Fitr", "Religious"),
         ("LaborDay", "National"),
-        ("ColumbusDay", "National"),
         ("Halloween", "Cultural"),
-        ("EidAlAdha", "Religious"),
-        ("VeteransDay", "National"),
         ("Thanksgiving", "National"),
         ("Christmas", "Religious"),
-        ("Chanukah End", "Religious"),
         ("NewYear", "National"),
-        ("OrthodoxChristmas", "Religious"),
-        ("MartinLutherKingDay", "National"),
-        ("Easter", "Religious"),
     ]
-    
-    def __init__(
-        self, 
-        config: Config | None = None,
-        data_config: SyntheticDataConfig | None = None
-    ) -> None:
-        """
-        Initialize generator.
-        
-        Args:
-            config: Main application config
-            data_config: Synthetic data specific config
-        """
+
+    # Ten SNAP-like benefit days per month for each state (illustrative).
+    SNAP_DAYS: dict[str, set[int]] = {  # noqa: RUF012 - read-only lookup table
+        "CA": {1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+        "TX": {1, 3, 5, 6, 7, 9, 11, 12, 13, 15},
+        "WI": {2, 3, 5, 6, 8, 9, 11, 12, 14, 15},
+    }
+
+    # Monday .. Sunday multipliers: weekend peak.
+    DAY_OF_WEEK_EFFECT = np.array([0.90, 0.85, 0.85, 0.90, 1.05, 1.25, 1.20])
+
+    def __init__(self, data_config: SyntheticDataConfig | None = None) -> None:
         self.data_config = data_config or SyntheticDataConfig()
-        self._rng = np.random.default_rng(self.data_config.random_seed)
-        
-        # Extract settings from main config if provided
-        if config is not None and hasattr(config, "data"):
-            if hasattr(config.data, "start_date"):
-                self.data_config.start_date = config.data.start_date
-    
+
+    # ------------------------------------------------------------------ public
+
     def generate_all(self) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-        """
-        Generate all synthetic datasets.
-        
-        Returns:
-            Tuple of (sales, calendar, prices) DataFrames
-        """
-        logger.info("Generating synthetic data...")
-        calendar = self.generate_calendar()
-        sales = self.generate_sales()
-        prices = self.generate_prices()
-        
+        """Generate (sales, calendar, prices), consistent with each other."""
+        rng = np.random.default_rng(self.data_config.random_seed)
+        calendar = self._calendar(rng)
+        items, stores = self._items(), self._stores()
+        prices, price_matrix, regular = self._prices(rng, calendar, items, stores)
+        sales = self._sales(rng, calendar, items, stores, price_matrix, regular)
         logger.info(
-            f"Generated synthetic data: "
-            f"{len(sales):,} sales rows, "
-            f"{len(calendar):,} calendar rows, "
-            f"{len(prices):,} price rows"
+            "Generated synthetic data: %s sales rows, %s series, %s days",
+            f"{len(sales):,}",
+            f"{len(items) * len(stores):,}",
+            len(calendar),
         )
-        
         return sales, calendar, prices
-    
+
     def generate_calendar(self) -> pl.DataFrame:
-        """Generate calendar DataFrame with dates, events, and SNAP flags."""
-        start_date = datetime.strptime(self.data_config.start_date, "%Y-%m-%d")
-        dates = [start_date + timedelta(days=i) for i in range(self.data_config.n_days)]
-        
-        # Generate base calendar
-        calendar_data = {
-            "date": dates,
-            "d": [f"d_{i+1}" for i in range(len(dates))],
+        """Generate only the calendar table."""
+        return self.generate_all()[1]
+
+    def generate_sales(self) -> pl.DataFrame:
+        """Generate only the (long-format) sales table."""
+        return self.generate_all()[0]
+
+    def generate_prices(self) -> pl.DataFrame:
+        """Generate only the weekly price table."""
+        return self.generate_all()[2]
+
+    def write_m5_files(self, out_dir: str | Path) -> dict[str, Path]:
+        """Write the synthetic tables as M5-format CSVs (wide sales)."""
+        from src.data.loader import write_m5_files
+
+        sales, calendar, prices = self.generate_all()
+        return write_m5_files(sales, calendar, prices, out_dir)
+
+    # ----------------------------------------------------------------- helpers
+
+    def _items(self) -> list[tuple[str, str, str]]:
+        """Return (item_id, dept_id, cat_id), spreading items across departments."""
+        items = []
+        for i in range(self.data_config.n_items):
+            cat_id, dept_id = self.DEPARTMENTS[i % len(self.DEPARTMENTS)]
+            items.append((f"{dept_id}_{i + 1:03d}", dept_id, cat_id))
+        return items
+
+    def _stores(self) -> list[str]:
+        all_stores = [s for stores in self.STORES.values() for s in stores]
+        return all_stores[: self.data_config.n_stores]
+
+    def _dates(self) -> list[date]:
+        start = date.fromisoformat(self.data_config.start_date)
+        return [start + timedelta(days=i) for i in range(self.data_config.n_days)]
+
+    def _calendar(self, rng: np.random.Generator) -> pl.DataFrame:
+        dates = self._dates()
+        n = len(dates)
+        is_event = rng.random(n) < self.data_config.event_probability
+        event_idx = rng.integers(0, len(self.EVENTS), n)
+        event_name = [
+            self.EVENTS[j][0] if e else None for e, j in zip(is_event, event_idx, strict=True)
+        ]
+        event_type = [
+            self.EVENTS[j][1] if e else None for e, j in zip(is_event, event_idx, strict=True)
+        ]
+
+        data: dict[str, list[object]] = {
+            "date": list(dates),
             "wm_yr_wk": [d.isocalendar()[0] * 100 + d.isocalendar()[1] for d in dates],
             "weekday": [d.strftime("%A") for d in dates],
             "wday": [d.isoweekday() for d in dates],
             "month": [d.month for d in dates],
             "year": [d.year for d in dates],
+            "d": [f"d_{i + 1}" for i in range(n)],
+            "event_name_1": list(event_name),
+            "event_type_1": list(event_type),
+            "event_name_2": [None] * n,
+            "event_type_2": [None] * n,
         }
-        
-        # Add events (sparse)
-        event_mask = self._rng.random(len(dates)) < self.data_config.event_probability
-        event_names_1 = []
-        event_types_1 = []
-        
-        for is_event in event_mask:
-            if is_event:
-                event = self._rng.choice(len(self.EVENTS))
-                event_names_1.append(self.EVENTS[event][0])
-                event_types_1.append(self.EVENTS[event][1])
-            else:
-                event_names_1.append(None)
-                event_types_1.append(None)
-        
-        calendar_data["event_name_1"] = event_names_1
-        calendar_data["event_type_1"] = event_types_1
-        calendar_data["event_name_2"] = [None] * len(dates)
-        calendar_data["event_type_2"] = [None] * len(dates)
-        
-        # Add SNAP flags (semi-random pattern)
-        for state in self.STORES.keys():
-            snap_pattern = self._generate_snap_pattern(len(dates))
-            calendar_data[f"snap_{state}"] = snap_pattern
-        
-        return pl.DataFrame(calendar_data)
-    
-    def generate_sales(self) -> pl.DataFrame:
-        """Generate sales DataFrame with realistic demand patterns."""
-        # Generate item and store combinations
-        items = self._generate_items()
-        stores = self._get_all_stores()
-        
-        n_items = min(len(items), self.data_config.n_items)
-        n_stores = min(len(stores), self.data_config.n_stores)
-        
-        items = items[:n_items]
-        stores = stores[:n_stores]
-        
-        sales_records = []
-        
-        for item in items:
-            item_base_demand = max(
-                0,
-                self._rng.normal(
-                    self.data_config.base_demand_mean,
-                    self.data_config.base_demand_std
-                )
-            )
-            
-            for store in stores:
-                store_multiplier = 0.8 + self._rng.random() * 0.4  # 0.8 to 1.2
-                
-                # Generate daily sales
-                daily_sales = self._generate_demand_series(
-                    item_base_demand * store_multiplier,
-                    self.data_config.n_days
-                )
-                
-                for day_idx, sales in enumerate(daily_sales):
-                    sales_records.append({
-                        "id": f"{item['item_id']}_{store}_evaluation",
-                        "item_id": item["item_id"],
-                        "dept_id": item["dept_id"],
-                        "cat_id": item["cat_id"],
-                        "store_id": store,
-                        "state_id": store.split("_")[0],
-                        "d": f"d_{day_idx + 1}",
-                        "sales": max(0, int(round(sales))),
-                    })
-        
-        return pl.DataFrame(sales_records)
-    
-    def generate_prices(self) -> pl.DataFrame:
-        """Generate price DataFrame with variations and promotions."""
-        items = self._generate_items()[:self.data_config.n_items]
-        stores = self._get_all_stores()[:self.data_config.n_stores]
-        
-        # Get unique weeks
-        start_date = datetime.strptime(self.data_config.start_date, "%Y-%m-%d")
-        weeks = set()
-        for day in range(self.data_config.n_days):
-            d = start_date + timedelta(days=day)
-            weeks.add(d.isocalendar()[0] * 100 + d.isocalendar()[1])
-        weeks = sorted(weeks)
-        
-        price_records = []
-        
-        for item in items:
-            # Base price for item
-            base_price = max(
-                0.5,
-                self._rng.normal(
-                    self.data_config.price_mean,
-                    self.data_config.price_std
-                )
-            )
-            
-            for store in stores:
-                # Store-specific price variation (±5%)
-                store_price = base_price * (0.95 + self._rng.random() * 0.1)
-                
-                for week in weeks:
-                    # Possible promotion
-                    if self._rng.random() < self.data_config.promotion_probability:
-                        price = store_price * (1 - self.data_config.promotion_discount)
-                    else:
-                        # Small weekly variation
-                        price = store_price * (0.98 + self._rng.random() * 0.04)
-                    
-                    price_records.append({
-                        "store_id": store,
-                        "item_id": item["item_id"],
-                        "wm_yr_wk": week,
-                        "sell_price": round(price, 2),
-                    })
-        
-        return pl.DataFrame(price_records)
-    
-    def _generate_items(self) -> list[dict]:
-        """Generate item metadata."""
-        items = []
-        item_counter = 1
-        
-        for cat_id, dept_ids in self.CATEGORIES.items():
-            for dept_id in dept_ids:
-                # Generate items per department
-                n_items_per_dept = max(1, self.data_config.n_items // 7)
-                
-                for _ in range(n_items_per_dept):
-                    items.append({
-                        "item_id": f"{dept_id}_{item_counter:03d}",
-                        "dept_id": dept_id,
-                        "cat_id": cat_id,
-                    })
-                    item_counter += 1
-        
-        return items
-    
-    def _get_all_stores(self) -> list[str]:
-        """Get flat list of all stores."""
-        stores = []
-        for state_stores in self.STORES.values():
-            stores.extend(state_stores)
-        return stores
-    
-    def _generate_demand_series(self, base_demand: float, n_days: int) -> np.ndarray:
-        """Generate demand series with seasonality and noise."""
+        for state, days in self.SNAP_DAYS.items():
+            data[f"snap_{state}"] = [int(d.day in days) for d in dates]
+
+        return pl.DataFrame(
+            data,
+            schema_overrides={
+                "event_name_1": pl.String,
+                "event_type_1": pl.String,
+                "event_name_2": pl.String,
+                "event_type_2": pl.String,
+            },
+        )
+
+    def _prices(
+        self,
+        rng: np.random.Generator,
+        calendar: pl.DataFrame,
+        items: list[tuple[str, str, str]],
+        stores: list[str],
+    ) -> tuple[pl.DataFrame, np.ndarray, np.ndarray]:
+        """Weekly prices per series, plus (series x day) price and regular price arrays."""
+        cfg = self.data_config
+        weeks = calendar["wm_yr_wk"].unique(maintain_order=True).to_numpy()
+        n_series, n_weeks = len(items) * len(stores), len(weeks)
+
+        base = np.maximum(0.5, rng.normal(cfg.price_mean, cfg.price_std, len(items)))
+        regular = np.repeat(base, len(stores)) * (0.95 + 0.1 * rng.random(n_series))
+        promo = rng.random((n_series, n_weeks)) < cfg.promotion_probability
+        wobble = 0.98 + 0.04 * rng.random((n_series, n_weeks))
+        weekly = np.round(np.where(promo, 1 - cfg.promotion_discount, wobble) * regular[:, None], 2)
+
+        prices = pl.DataFrame(
+            {
+                "store_id": np.repeat([s for _ in items for s in stores], n_weeks),
+                "item_id": np.repeat([it[0] for it in items for _ in stores], n_weeks),
+                "wm_yr_wk": np.tile(weeks, n_series),
+                "sell_price": weekly.ravel(),
+            }
+        )
+
+        week_pos = {w: i for i, w in enumerate(weeks)}
+        day_week_idx = np.array([week_pos[w] for w in calendar["wm_yr_wk"].to_list()])
+        return prices, weekly[:, day_week_idx], regular
+
+    def _sales(
+        self,
+        rng: np.random.Generator,
+        calendar: pl.DataFrame,
+        items: list[tuple[str, str, str]],
+        stores: list[str],
+        price_matrix: np.ndarray,
+        regular: np.ndarray,
+    ) -> pl.DataFrame:
+        cfg = self.data_config
+        n_days = len(calendar)
+        n_series = len(items) * len(stores)
+        dates = calendar["date"].to_list()
         t = np.arange(n_days)
-        demand = np.ones(n_days) * base_demand
-        
-        # Weekly seasonality (higher on weekends)
-        if self.data_config.weekly_seasonality:
-            weekly = 0.3 * np.sin(2 * np.pi * t / 7)
-            demand = demand * (1 + weekly)
-        
-        # Monthly seasonality
-        if self.data_config.monthly_seasonality:
-            monthly = 0.15 * np.sin(2 * np.pi * t / 30.4)
-            demand = demand * (1 + monthly)
-        
-        # Yearly seasonality (higher in Q4)
-        if self.data_config.yearly_seasonality:
-            yearly = 0.2 * np.sin(2 * np.pi * (t - 90) / 365)
-            demand = demand * (1 + yearly)
-        
-        # Add noise
-        noise = self._rng.normal(0, base_demand * 0.3, n_days)
-        demand = demand + noise
-        
-        # Add trend (slight growth)
-        trend = 1 + 0.0001 * t
-        demand = demand * trend
-        
-        return np.maximum(0, demand)
-    
-    def _generate_snap_pattern(self, n_days: int) -> list[int]:
-        """Generate SNAP benefit pattern."""
-        pattern = []
-        for day in range(n_days):
-            # SNAP benefits typically available at start of month
-            day_of_month = (day % 30) + 1
-            is_snap_day = day_of_month <= 10  # First 10 days of month
-            pattern.append(int(is_snap_day))
-        return pattern
+
+        dow = np.array([d.weekday() for d in dates])
+        doy = np.array([d.timetuple().tm_yday for d in dates])
+        seasonal = (
+            self.DAY_OF_WEEK_EFFECT[dow]
+            * (1 + 0.15 * np.sin(2 * np.pi * (doy - 258) / 365.25))
+            * (1 + cfg.trend_per_year * t / 365.25)
+        )
+        event = np.where(calendar["event_name_1"].is_not_null().to_numpy(), cfg.event_uplift, 1.0)
+
+        sigma = cfg.base_demand_dispersion
+        base = np.exp(rng.normal(np.log(cfg.base_demand_mean) - sigma**2 / 2, sigma, len(items)))
+        store_mult = 0.8 + 0.4 * rng.random(n_series)
+        series_base = np.repeat(base, len(stores)) * store_mult
+
+        states = [s.split("_")[0] for _ in items for s in stores]
+        is_food = np.array([it[2] == "FOODS" for it in items for _ in stores])
+        snap = np.vstack([calendar[f"snap_{st}"].to_numpy() for st in states])
+        snap_mult = np.where((snap == 1) & is_food[:, None], cfg.snap_uplift_foods, 1.0)
+
+        price_effect = (price_matrix / regular[:, None]) ** (-cfg.price_elasticity)
+        noise = rng.gamma(cfg.noise_shape, 1 / cfg.noise_shape, (n_series, n_days))
+
+        rate = series_base[:, None] * seasonal[None, :] * event[None, :]
+        counts = rng.poisson(rate * snap_mult * price_effect * noise)
+
+        ids = [f"{it[0]}_{s}_evaluation" for it in items for s in stores]
+        return pl.DataFrame(
+            {
+                "id": np.repeat(ids, n_days),
+                "item_id": np.repeat([it[0] for it in items for _ in stores], n_days),
+                "dept_id": np.repeat([it[1] for it in items for _ in stores], n_days),
+                "cat_id": np.repeat([it[2] for it in items for _ in stores], n_days),
+                "store_id": np.repeat([s for _ in items for s in stores], n_days),
+                "state_id": np.repeat(states, n_days),
+                "d": np.tile(calendar["d"].to_numpy(), n_series),
+                "sales": counts.ravel().astype(np.int64),
+            }
+        )

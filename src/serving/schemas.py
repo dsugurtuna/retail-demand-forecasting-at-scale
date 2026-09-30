@@ -4,7 +4,7 @@ Pydantic schemas for API request/response models.
 
 from __future__ import annotations
 
-from datetime import datetime, date
+from datetime import UTC, date, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -12,14 +12,14 @@ from pydantic import BaseModel, Field, field_validator
 
 class PredictionItem(BaseModel):
     """Single item prediction."""
-    
+
     item_id: str
     store_id: str
     date: date
     prediction: float
     lower_bound: float | None = None
     upper_bound: float | None = None
-    
+
     @field_validator("prediction", "lower_bound", "upper_bound", mode="before")
     @classmethod
     def round_predictions(cls, v):
@@ -30,28 +30,32 @@ class PredictionItem(BaseModel):
 
 class ForecastRequest(BaseModel):
     """Request for a single forecast."""
-    
+
     item_id: str = Field(..., description="Product/item identifier")
     store_id: str = Field(..., description="Store identifier")
     forecast_date: date = Field(..., description="Date to forecast")
-    
+
     # Optional features
     price: float | None = Field(None, ge=0, description="Item price")
     snap_enabled: bool | None = Field(None, description="SNAP eligibility")
     event_name: str | None = Field(None, description="Event/holiday name")
-    
-    model_config = {"json_schema_extra": {"example": {
-        "item_id": "FOODS_3_090",
-        "store_id": "CA_1",
-        "forecast_date": "2024-01-15",
-        "price": 2.49,
-        "snap_enabled": True,
-    }}}
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "item_id": "FOODS_3_090",
+                "store_id": "CA_1",
+                "forecast_date": "2024-01-15",
+                "price": 2.49,
+                "snap_enabled": True,
+            }
+        }
+    }
 
 
 class ForecastResponse(BaseModel):
     """Response for a single forecast."""
-    
+
     item_id: str
     store_id: str
     forecast_date: date
@@ -60,26 +64,30 @@ class ForecastResponse(BaseModel):
     prediction_upper: float | None = None
     model_version: str
     inference_time_ms: float
-    
-    model_config = {"json_schema_extra": {"example": {
-        "item_id": "FOODS_3_090",
-        "store_id": "CA_1",
-        "forecast_date": "2024-01-15",
-        "prediction": 12.5,
-        "prediction_lower": 8.2,
-        "prediction_upper": 16.8,
-        "model_version": "v2.1.0",
-        "inference_time_ms": 15.3,
-    }}}
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "item_id": "FOODS_3_090",
+                "store_id": "CA_1",
+                "forecast_date": "2024-01-15",
+                "prediction": 12.5,
+                "prediction_lower": 8.2,
+                "prediction_upper": 16.8,
+                "model_version": "v2.1.0",
+                "inference_time_ms": 15.3,
+            }
+        }
+    }
 
 
 class BatchForecastRequest(BaseModel):
     """Request for batch forecasts."""
-    
+
     items: list[ForecastRequest] = Field(..., max_length=1000)
     horizon_days: int = Field(default=28, ge=1, le=90)
     return_intervals: bool = Field(default=True)
-    
+
     @field_validator("items")
     @classmethod
     def validate_items(cls, v):
@@ -90,23 +98,24 @@ class BatchForecastRequest(BaseModel):
 
 class BatchForecastResponse(BaseModel):
     """Response for batch forecasts."""
-    
+
     predictions: list[PredictionItem]
     n_items: int
     total_predictions: int
     model_version: str
     inference_time_ms: float
-    
+
     @property
     def predictions_df(self):
         """Convert predictions to pandas DataFrame."""
         import pandas as pd
+
         return pd.DataFrame([p.model_dump() for p in self.predictions])
 
 
 class HorizonForecastRequest(BaseModel):
     """Request for multi-horizon forecast."""
-    
+
     item_id: str
     store_id: str
     start_date: date
@@ -117,7 +126,7 @@ class HorizonForecastRequest(BaseModel):
 
 class HorizonForecastResponse(BaseModel):
     """Response for multi-horizon forecast."""
-    
+
     item_id: str
     store_id: str
     forecasts: list[PredictionItem]
@@ -127,7 +136,7 @@ class HorizonForecastResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     """Health check response."""
-    
+
     status: str = "healthy"
     model_loaded: bool
     model_version: str | None
@@ -139,7 +148,7 @@ class HealthResponse(BaseModel):
 
 class ModelInfoResponse(BaseModel):
     """Model information response."""
-    
+
     name: str
     version: str
     framework: str
@@ -152,8 +161,8 @@ class ModelInfoResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     """Error response."""
-    
+
     error: str
     detail: str | None = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     request_id: str | None = None

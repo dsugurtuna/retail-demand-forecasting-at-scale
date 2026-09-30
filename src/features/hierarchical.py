@@ -1,17 +1,21 @@
 """
-Hierarchical feature engineering for multi-level forecasting.
+Hierarchical features: how each series' wider group (item, department,
+category, store, state) has been selling.
 
-Implements cross-level aggregation features:
-- Item-level features aggregated from stores
-- Category-level features
-- Store-level features
-- Regional features
+For every hierarchy level the module builds that level's daily total, shifts it
+by ``min_lag`` days and takes rolling statistics, then joins the result back to
+each row. It also adds each series' share of its level's volume, again from
+lagged values only.
+
+Earlier versions of this module joined same-day level totals (and same-day
+shares such as ``sales / category_daily_sum``) onto each row. Those contain
+the row's own target, so a model could "predict" sales it had already been
+shown. Nothing here uses target values younger than ``min_lag`` days.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import polars as pl
 from pydantic import BaseModel, Field
@@ -21,248 +25,103 @@ logger = logging.getLogger(__name__)
 
 class HierarchicalFeaturesConfig(BaseModel):
     """Configuration for hierarchical features."""
-    
+
     hierarchy_levels: list[str] = Field(
         default=["item_id", "dept_id", "cat_id", "store_id", "state_id"],
-        description="Hierarchy levels from bottom to top"
+        description="Grouping columns; levels missing from the data are skipped",
     )
-    
-    aggregations: list[str] = Field(
-        default=["mean", "std", "sum", "count"],
-        description="Aggregation functions to apply"
-    )
-    
-    rolling_window: int = Field(
-        default=28,
-        description="Rolling window for aggregations"
-    )
-    
-    min_lag: int = Field(
-        default=28,
-        description="Minimum lag to prevent leakage"
-    )
+    rolling_window: int = Field(default=28, ge=1, description="Rolling window in days")
+    min_lag: int = Field(default=28, ge=1, description="Minimum age in days of target values")
 
 
 class HierarchicalFeatures:
-    """
-    Hierarchical feature engineering for multi-level demand forecasting.
-    
-    Generates cross-level aggregation features that capture:
-    - Item performance across stores
-    - Category-level trends
-    - Store-level performance
-    - Regional patterns
-    
-    This is critical for hierarchical forecasting where predictions
-    at different levels need to be coherent.
-    
+    """Generate lagged, level-aggregated demand features.
+
     Example:
-        >>> config = HierarchicalFeaturesConfig()
-        >>> hierarchical = HierarchicalFeatures(config)
+        >>> hierarchical = HierarchicalFeatures()
         >>> features = hierarchical.transform(df)
     """
-    
+
     def __init__(self, config: HierarchicalFeaturesConfig | None = None) -> None:
-        """
-        Initialize hierarchical feature generator.
-        
-        Args:
-            config: Feature configuration
-        """
         self.config = config or HierarchicalFeaturesConfig()
-    
+
     def transform(
         self,
         df: pl.DataFrame,
         target_col: str = "sales",
-        date_col: str = "date"
+        date_col: str = "date",
+        group_col: str = "id",
     ) -> pl.DataFrame:
-        """
-        Generate all hierarchical features.
-        
-        Args:
-            df: Input DataFrame
-            target_col: Name of target column
-            date_col: Date column name
-            
-        Returns:
-            DataFrame with hierarchical features added
-        """
-        logger.info("Generating hierarchical features...")
-        
-        # Generate aggregations at each hierarchy level
+        """Add level aggregates and lagged shares for every level present in ``df``."""
+        window, lag = self.config.rolling_window, self.config.min_lag
+        own_roll = f"_own_roll_mean_{window}"
+        df = df.sort([group_col, date_col]).with_columns(
+            pl.col(target_col)
+            .shift(lag)
+            .rolling_mean(window_size=window)
+            .over(group_col)
+            .alias(own_roll)
+        )
+
         for level in self.config.hierarchy_levels:
             if level in df.columns:
-                df = self._create_level_features(df, target_col, level, date_col)
-        
-        # Create cross-level features
-        df = self._create_cross_level_features(df, target_col)
-        
-        n_features = len([c for c in df.columns if "_agg_" in c or "_share" in c])
-        logger.info(f"Generated {n_features} hierarchical features")
-        
-        return df
-    
-    def _create_level_features(
-        self,
-        df: pl.DataFrame,
-        target_col: str,
-        level_col: str,
-        date_col: str
-    ) -> pl.DataFrame:
-        """Create aggregated features at a hierarchy level."""
-        level_name = level_col.replace("_id", "")
-        base_shift = self.config.min_lag
-        
-        # Daily aggregation at this level
-        daily_agg = (
-            df.group_by([level_col, date_col])
-            .agg([
-                pl.col(target_col).sum().alias(f"{level_name}_daily_sum"),
-                pl.col(target_col).mean().alias(f"{level_name}_daily_mean"),
-                pl.col(target_col).std().alias(f"{level_name}_daily_std"),
-                pl.col(target_col).count().alias(f"{level_name}_daily_count"),
-            ])
-        )
-        
-        df = df.join(daily_agg, on=[level_col, date_col], how="left")
-        
-        # Rolling aggregations at this level
-        rolling_exprs = []
-        window = self.config.rolling_window
-        
-        if f"{level_name}_daily_sum" in df.columns:
-            rolling_exprs.extend([
-                pl.col(f"{level_name}_daily_sum")
-                .shift(base_shift)
-                .rolling_mean(window_size=window)
-                .over(level_col)
-                .alias(f"{level_name}_agg_roll_mean_{window}"),
-                
-                pl.col(f"{level_name}_daily_sum")
-                .shift(base_shift)
-                .rolling_std(window_size=window)
-                .over(level_col)
-                .alias(f"{level_name}_agg_roll_std_{window}"),
-            ])
-        
-        if rolling_exprs:
-            df = df.with_columns(rolling_exprs)
-        
-        return df
-    
-    def _create_cross_level_features(
-        self,
-        df: pl.DataFrame,
-        target_col: str
-    ) -> pl.DataFrame:
-        """Create features that compare across hierarchy levels."""
-        exprs = []
-        
-        # Share of category
-        if "cat_daily_sum" in df.columns:
-            exprs.append(
-                (pl.col(target_col) / (pl.col("cat_daily_sum") + 1e-8))
-                .alias("share_of_category")
-            )
-        
-        # Share of store
-        if "store_daily_sum" in df.columns:
-            exprs.append(
-                (pl.col(target_col) / (pl.col("store_daily_sum") + 1e-8))
-                .alias("share_of_store")
-            )
-        
-        # Share of state/region
-        if "state_daily_sum" in df.columns:
-            exprs.append(
-                (pl.col(target_col) / (pl.col("state_daily_sum") + 1e-8))
-                .alias("share_of_state")
-            )
-        
-        # Item performance vs category average
-        if "cat_daily_mean" in df.columns:
-            exprs.append(
-                (pl.col(target_col) / (pl.col("cat_daily_mean") + 1e-8))
-                .alias("vs_category_avg")
-            )
-        
-        # Item performance vs store average
-        if "store_daily_mean" in df.columns:
-            exprs.append(
-                (pl.col(target_col) / (pl.col("store_daily_mean") + 1e-8))
-                .alias("vs_store_avg")
-            )
-        
-        if exprs:
-            df = df.with_columns(exprs)
-        
-        return df
-    
-    def aggregate_forecasts(
-        self,
-        forecasts: pl.DataFrame,
-        method: str = "bottom_up"
-    ) -> pl.DataFrame:
-        """
-        Aggregate forecasts across hierarchy levels.
-        
-        Args:
-            forecasts: DataFrame with bottom-level forecasts
-            method: Aggregation method ('bottom_up', 'top_down', 'middle_out')
-            
-        Returns:
-            DataFrame with aggregated forecasts at all levels
-        """
-        if method == "bottom_up":
-            return self._bottom_up_aggregate(forecasts)
-        elif method == "top_down":
-            return self._top_down_aggregate(forecasts)
-        else:
-            raise ValueError(f"Unknown aggregation method: {method}")
-    
-    def _bottom_up_aggregate(self, forecasts: pl.DataFrame) -> pl.DataFrame:
-        """Aggregate forecasts from bottom to top of hierarchy."""
-        result = forecasts.clone()
-        
-        # Aggregate up each level
-        for level in reversed(self.config.hierarchy_levels[:-1]):
-            if level in result.columns:
-                level_agg = (
-                    result.group_by([level, "date"])
-                    .agg(pl.col("forecast").sum().alias(f"forecast_{level}"))
+                df = self._level_features(df, target_col, level, date_col)
+                name = level.removesuffix("_id")
+                df = df.with_columns(
+                    (pl.col(own_roll) / (pl.col(f"{name}_agg_roll_mean_{window}") + 1e-8)).alias(
+                        f"share_of_{name}"
+                    )
                 )
-                result = result.join(level_agg, on=[level, "date"], how="left")
-        
-        return result
-    
-    def _top_down_aggregate(self, forecasts: pl.DataFrame) -> pl.DataFrame:
-        """Distribute forecasts from top to bottom using proportions."""
-        # This is a simplified implementation
-        # Full implementation would use historical proportions
-        return forecasts
-    
-    def get_feature_names(self) -> list[str]:
-        """Get list of feature names that will be generated."""
-        features = []
-        
+        return df.drop(own_roll)
+
+    def _level_features(
+        self, df: pl.DataFrame, target_col: str, level_col: str, date_col: str
+    ) -> pl.DataFrame:
+        name = level_col.removesuffix("_id")
+        window, lag = self.config.rolling_window, self.config.min_lag
+        target = pl.col(target_col)
+
+        # A level-day total is null (unknown) when every member is null, for
+        # example after the forecast origin where the target is masked.
+        daily = (
+            df.group_by([level_col, date_col])
+            .agg(pl.when(target.is_null().all()).then(None).otherwise(target.sum()).alias("_total"))
+            .sort([level_col, date_col])
+        )
+        shifted = pl.col("_total").shift(lag)
+        daily = daily.with_columns(
+            shifted.rolling_mean(window_size=window)
+            .over(level_col)
+            .alias(f"{name}_agg_roll_mean_{window}"),
+            shifted.rolling_std(window_size=window)
+            .over(level_col)
+            .alias(f"{name}_agg_roll_std_{window}"),
+        ).drop("_total")
+
+        return df.join(daily, on=[level_col, date_col], how="left")
+
+    def get_feature_names(self, columns: list[str] | None = None) -> list[str]:
+        """Feature names produced for the given input columns (all levels if None)."""
+        window = self.config.rolling_window
+        names = []
         for level in self.config.hierarchy_levels:
-            level_name = level.replace("_id", "")
-            features.extend([
-                f"{level_name}_daily_sum",
-                f"{level_name}_daily_mean",
-                f"{level_name}_daily_std",
-                f"{level_name}_daily_count",
-                f"{level_name}_agg_roll_mean_{self.config.rolling_window}",
-                f"{level_name}_agg_roll_std_{self.config.rolling_window}",
-            ])
-        
-        features.extend([
-            "share_of_category",
-            "share_of_store",
-            "share_of_state",
-            "vs_category_avg",
-            "vs_store_avg",
-        ])
-        
-        return features
+            if columns is not None and level not in columns:
+                continue
+            name = level.removesuffix("_id")
+            names += [
+                f"{name}_agg_roll_mean_{window}",
+                f"{name}_agg_roll_std_{window}",
+                f"share_of_{name}",
+            ]
+        return names
+
+    def aggregate_forecasts(self, forecasts: pl.DataFrame, date_col: str = "date") -> pl.DataFrame:
+        """Bottom-up aggregation: add ``forecast_<level>`` totals for each level present."""
+        result = forecasts
+        for level in self.config.hierarchy_levels:
+            if level in result.columns:
+                totals = result.group_by([level, date_col]).agg(
+                    pl.col("forecast").sum().alias(f"forecast_{level}")
+                )
+                result = result.join(totals, on=[level, date_col], how="left")
+        return result

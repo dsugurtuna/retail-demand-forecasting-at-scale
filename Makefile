@@ -1,165 +1,52 @@
-# =============================================================================
-# Makefile for Retail Demand Forecasting
-# =============================================================================
-# Convenience commands for development, testing, and deployment
-# =============================================================================
+# Convenience commands. Each target is a one-liner you can also run directly.
 
-.PHONY: help install install-dev lint format test test-unit test-integration \
-        coverage clean docker-build docker-up docker-down train serve
+.PHONY: help install install-dev lint format typecheck test test-fast smoke train-synthetic serve clean
 
-# Default target
 help:
-	@echo "Retail Demand Forecasting - Available Commands"
-	@echo "=============================================="
-	@echo ""
-	@echo "Setup:"
-	@echo "  make install         Install production dependencies"
-	@echo "  make install-dev     Install development dependencies"
-	@echo ""
-	@echo "Code Quality:"
-	@echo "  make lint           Run linting (ruff)"
-	@echo "  make format         Format code (black)"
-	@echo "  make typecheck      Run type checking (mypy)"
-	@echo "  make quality        Run all quality checks"
-	@echo ""
-	@echo "Testing:"
-	@echo "  make test           Run all tests"
-	@echo "  make test-unit      Run unit tests only"
-	@echo "  make test-integration Run integration tests"
-	@echo "  make coverage       Run tests with coverage report"
-	@echo ""
-	@echo "Docker:"
-	@echo "  make docker-build   Build Docker images"
-	@echo "  make docker-up      Start all services"
-	@echo "  make docker-down    Stop all services"
-	@echo ""
-	@echo "Application:"
-	@echo "  make train          Run model training"
-	@echo "  make serve          Start API server"
-	@echo ""
-	@echo "Maintenance:"
-	@echo "  make clean          Clean build artifacts"
-
-# =============================================================================
-# Setup
-# =============================================================================
+	@echo "install        pip install -e ."
+	@echo "install-dev    pip install -e '.[dev]'"
+	@echo "lint           ruff check + ruff format --check"
+	@echo "format         ruff format + ruff check --fix"
+	@echo "typecheck      mypy src"
+	@echo "test           full test suite, including the smoke training run"
+	@echo "test-fast      tests without the slow end-to-end runs"
+	@echo "smoke          python -m src.train --smoke (synthetic data, ~1 minute)"
+	@echo "train-synthetic  larger synthetic run (210 items x 10 stores x 1,941 days)"
+	@echo "serve          API on :8000 using the smoke model"
+	@echo "clean          remove caches and artefacts"
 
 install:
 	pip install -e .
 
 install-dev:
 	pip install -e ".[dev]"
-	pre-commit install
-
-# =============================================================================
-# Code Quality
-# =============================================================================
 
 lint:
 	ruff check src tests
+	ruff format --check src tests
 
 format:
-	black src tests
+	ruff format src tests
 	ruff check --fix src tests
 
 typecheck:
-	mypy src --ignore-missing-imports
-
-quality: lint typecheck
-	@echo "All quality checks passed!"
-
-# =============================================================================
-# Testing
-# =============================================================================
+	mypy src
 
 test:
-	pytest tests/ -v
+	pytest
 
-test-unit:
-	pytest tests/unit/ -v
+test-fast:
+	pytest -m "not slow"
 
-test-integration:
-	pytest tests/integration/ -v -m "not slow"
+smoke:
+	python -m src.train --smoke
 
-test-slow:
-	pytest tests/ -v -m slow
-
-coverage:
-	pytest tests/ --cov=src --cov-report=html --cov-report=xml
-	@echo "Coverage report generated in htmlcov/"
-
-# =============================================================================
-# Docker
-# =============================================================================
-
-docker-build:
-	docker-compose build
-
-docker-up:
-	docker-compose up -d
-
-docker-down:
-	docker-compose down
-
-docker-logs:
-	docker-compose logs -f
-
-docker-train:
-	docker-compose --profile training up training
-
-docker-dev:
-	docker-compose --profile dev up jupyter
-
-# =============================================================================
-# Application
-# =============================================================================
-
-train:
-	python -m src.train
+train-synthetic:
+	python -m src.train --synthetic --n-items 210 --n-stores 10 --n-days 1941 --output-dir artefacts/synthetic
 
 serve:
-	uvicorn src.serving.api:app --host 0.0.0.0 --port 8000 --reload
-
-serve-prod:
-	uvicorn src.serving.api:app --host 0.0.0.0 --port 8000 --workers 4
-
-# =============================================================================
-# Data
-# =============================================================================
-
-data-download:
-	@echo "Downloading M5 competition data..."
-	mkdir -p data/raw
-	# kaggle competitions download -c m5-forecasting-accuracy -p data/raw
-
-data-process:
-	python -m src.data.preprocessor
-
-# =============================================================================
-# MLflow
-# =============================================================================
-
-mlflow-ui:
-	mlflow ui --host 0.0.0.0 --port 5000
-
-# =============================================================================
-# Cleanup
-# =============================================================================
+	FORECAST_MODEL_PATH=artefacts/smoke/model uvicorn src.serving.api:app --host 127.0.0.1 --port 8000
 
 clean:
-	rm -rf build/
-	rm -rf dist/
-	rm -rf *.egg-info
-	rm -rf .pytest_cache
-	rm -rf .mypy_cache
-	rm -rf .ruff_cache
-	rm -rf htmlcov/
-	rm -rf .coverage
-	find . -type d -name __pycache__ -exec rm -rf {} +
-	find . -type f -name "*.pyc" -delete
-
-clean-all: clean
-	rm -rf mlruns/
-	rm -rf models/*.pkl
-	rm -rf data/processed/
-	rm -rf data/features/
+	rm -rf build dist *.egg-info .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage artefacts
+	find . -type d -name __pycache__ -prune -exec rm -rf {} +
